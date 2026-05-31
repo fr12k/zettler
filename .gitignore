@@ -1,0 +1,4 @@
+.claude/
+.zig-cache/
+trash/
+zig-out/
