@@ -7,9 +7,10 @@
 //!
 //! In the original C++ code, terrain sprites (AssetMapGround) are fully
 //! opaque solid rectangles (SpriteTypeSolid). The diamond shape comes from
-//! a separate mask system (AssetMapMaskUp/AssetMapMaskDown) plus rendering
-//! each tile as two triangles. Here we achieve the same diamond shape by
-//! rendering each tile as a 4-vertex diamond (up+down triangles).
+//! a separate mask system (AssetMapMaskUp/AssetMapMaskDown) that clips each
+//! rectangular sprite to a triangle. Here we replicate that effect by
+//! rendering each tile as two explicit triangles with axis-aligned UV
+//! coordinates, so the sprite content maps correctly without a mask texture.
 
 const std = @import("std");
 const gl = @import("gl.zig");
@@ -93,6 +94,19 @@ fn terrainColor(t: Terrain) [4]f32 {
     };
 }
 
+/// Vertical screen offset per unit of terrain height (original game: 4 px).
+/// This is what produces the fake-2.5D relief: a vertex sitting on a tall tile
+/// is pushed up the screen, so hills rise and valleys sink.
+pub const HEIGHT_SCALE: f32 = 4.0;
+
+/// Height (in tile units) at a map position, clamped to the map bounds so edge
+/// tiles reuse the nearest in-bounds height instead of reading out of range.
+fn heightAt(map: *Map, x: usize, y: usize) f32 {
+    const xx: u16 = @intCast(@min(x, @as(usize, map.width) - 1));
+    const yy: u16 = @intCast(@min(y, @as(usize, map.height) - 1));
+    return @floatFromInt(map.getTileXY(xx, yy).height);
+}
+
 /// MapRenderer — draws terrain tiles.
 pub const MapRenderer = struct {
     shader: Shader = .{},
@@ -103,7 +117,8 @@ pub const MapRenderer = struct {
     initialized: bool = false,
     has_atlas: bool = false,
 
-    // x, y, u, v, r, g, b, a
+    // x, y, u, v, r, g, b, a  — standard sprite vertex layout.
+    // u/v are direct atlas UV coordinates (pre-computed per vertex).
     pub const Vertex = struct {
         x: f32,
         y: f32,
@@ -148,89 +163,126 @@ pub const MapRenderer = struct {
 
         const num_tiles = map.tileCount();
         const allocator = std.heap.page_allocator;
-        // Each tile = 4 vertices (diamond)
-        const vertices = try allocator.alloc(Vertex, num_tiles * 4);
+        // Each tile is a PARALLELOGRAM (32×20 px) rendered as two true triangles
+        // (6 vertices, no sharing) with AXIS-ALIGNED 1:1 texture sampling.
+        //
+        //   A ────────── B        A = (lx,    ly)
+        //    \  DOWN tri \        B = (lx+32, ly)
+        //     \  (A,B,C) \        D = (lx-16, ly+20)
+        //      D ──── C           C = (lx+16, ly+20)
+        //       \ UP tri (A,D,C)
+        //
+        // The UVs (see below) reproduce the original renderer's behaviour of
+        // blitting each 32×20 ground sprite axis-aligned and masking it to a
+        // triangle. Because the sampling is axis-aligned 1:1 (not sheared onto
+        // the parallelogram), adjacent same-terrain tiles continue the texture
+        // seamlessly.
+        const vertices = try allocator.alloc(Vertex, num_tiles * 6);
         defer allocator.free(vertices);
         const indices = try allocator.alloc(u16, num_tiles * 6);
         defer allocator.free(indices);
 
-        const hw = TileWidth / 2.0;   // 16 = half diamond width
-        const hh = TileHeight;         // 20 = half diamond height (diamond is 32×40)
-        // A full Settlers tile forms a diamond from two stacked triangles.
-        // The diamond center Y is at: row * TileHeight + TileHeight
-        // (top vertex at row*TileHeight, bottom at row*TileHeight+40)
+        const hw = TileWidth / 2.0; // 16
 
         for (0..map.height) |y| {
             for (0..map.width) |x| {
                 const ti = y * map.width + x;
+
+                // Screen-space top-left of this tile (C++: lx = col*32 - row*16).
+                const lx = @as(f32, @floatFromInt(x)) * TileWidth -
+                    @as(f32, @floatFromInt(y)) * hw;
+                const ly = @as(f32, @floatFromInt(y)) * TileHeight;
+
+                // Terrain and atlas lookup
                 const tile = map.getTileXY(@intCast(x), @intCast(y));
-
-                // Diamond center in isometric projection (matching C++ map_pix_from_map_coord).
-                // mx = 32*col - 16*row, my = 20*row
-                // Diamond center is at (mx + hw, my + hh).
-                const cx = @as(f32, @floatFromInt(x)) * TileWidth -
-                    @as(f32, @floatFromInt(y)) * hw + hw;
-                const cy = @as(f32, @floatFromInt(y)) * TileHeight + hh;
-
-                const vi = ti * 4;
-                const ii = ti * 6;
-
-                // Compute height-based sprite variant (0-7) using the C++ up-triangle
-                // mask formula: variant depends on height differences to lower and
-                // lower-right neighbors.
                 const m: i32 = @intCast(tile.height);
-                const left: i32 = if (y + 1 < map.height)
+                const lh: i32 = if (y + 1 < map.height)
                     @intCast(map.getTileXY(@intCast(x), @intCast(y + 1)).height)
-                else
-                    m;
-                const right: i32 = if (x + 1 < map.width and y + 1 < map.height)
+                else m;
+                const rh: i32 = if (x + 1 < map.width and y + 1 < map.height)
                     @intCast(map.getTileXY(@intCast(x + 1), @intCast(y + 1)).height)
-                else
-                    m;
-                const variant = heightVariant(m, left, right);
+                else m;
+                const variant = heightVariant(m, lh, rh);
 
-                // UV coordinates
-                var u: f32 = 0;
-                var v: f32 = 0;
-                var uw: f32 = 1;
-                var vh: f32 = 1;
-                var has_texture = false;
+                var eu: f32 = 0; var ev: f32 = 0;
+                var euw: f32 = 0; var evh: f32 = 0;
+                var has_tex = false;
                 if (atlas) |a| {
                     if (terrainSpriteId(tile.terrain, variant)) |sid| {
-                        if (a.get(sid)) |entry| {
-                            u = entry.u;
-                            v = entry.v;
-                            uw = entry.uw;
-                            vh = entry.vh;
-                            has_texture = true;
+                        if (a.get(sid)) |e| {
+                            eu = e.u; ev = e.v; euw = e.uw; evh = e.vh;
+                            has_tex = true;
                         }
                     }
                 }
+                const c: [4]f32 = if (has_tex) .{1,1,1,1} else terrainColor(tile.terrain);
 
-                const umid = u + uw / 2.0;
-                const vmid = v + vh / 2.0;
+                // AXIS-ALIGNED 1:1 texture mapping (matches the original masked-
+                // sprite renderer). Each triangle samples the sprite as if it were
+                // blitted axis-aligned at its own origin — NOT sheared onto the
+                // parallelogram. This is what makes adjacent same-terrain tiles
+                // tile seamlessly with no diagonal seams.
+                //
+                // Local UV = ((sx - origin_x)/32, (sy - origin_y)/20):
+                //   DOWN triangle (origin = A=(lx,ly)):
+                //     A(0,0)  B(1,0)  C(0.5,1)
+                //   UP triangle   (origin = (lx-16, ly), i.e. shifted half-tile):
+                //     A(0.5,0)  D(0,1)  C(1,1)
+                // Atlas coords: actual = (eu + lu*euw, ev + lv*evh)
+                // Each corner is a distinct grid vertex; offset its screen Y by
+                // -HEIGHT_SCALE*height(that grid pos) for the 2.5D relief. Because
+                // shared edges between tiles reference the SAME grid position,
+                // their heights match and the mesh stays gap-free.
+                //   A = (x,   y)    top-left
+                //   B = (x+1, y)    top-right
+                //   bottom-left  (lx-16) = (x,   y+1)
+                //   bottom-right (lx+16) = (x+1, y+1)
+                const hA = heightAt(map, x, y);
+                const hB = heightAt(map, x + 1, y);
+                const hBL = heightAt(map, x, y + 1);
+                const hBR = heightAt(map, x + 1, y + 1);
 
-                // Color: white when texturing, terrain color for fallback
-                const c: [4]f32 = if (has_texture) .{ 1, 1, 1, 1 } else terrainColor(tile.terrain);
+                const xA = lx;             const yA = ly - HEIGHT_SCALE * hA;
+                const xB = lx + TileWidth; const yB = ly - HEIGHT_SCALE * hB;
+                const xD = lx - hw;        const yD = ly + TileHeight - HEIGHT_SCALE * hBL;
+                const xC = lx + hw;        const yC = ly + TileHeight - HEIGHT_SCALE * hBR;
 
-                // Diamond quad: 4 vertices forming a diamond shape.
-                // Order: top, right, bottom, left (matching sprite_batcher.addTexturedQuad).
-                vertices[vi + 0] = .{ .x = cx, .y = cy - hh, .u = umid, .v = v,     .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
-                vertices[vi + 1] = .{ .x = cx + hw, .y = cy, .u = u + uw, .v = vmid, .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
-                vertices[vi + 2] = .{ .x = cx, .y = cy + hh, .u = umid, .v = v + vh, .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
-                vertices[vi + 3] = .{ .x = cx - hw, .y = cy, .u = u,     .v = vmid, .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
-                // Indices: two triangles (TL->TR->BR) + (TL->BR->BL)
+                const vi = ti * 6;
+                const ii = ti * 6;
+
+                // DOWN triangle A,B,C
+                vertices[vi + 0] = .{ .x = xA, .y = yA,
+                    .u = eu,             .v = ev,
+                    .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
+                vertices[vi + 1] = .{ .x = xB, .y = yB,
+                    .u = eu + euw,       .v = ev,
+                    .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
+                vertices[vi + 2] = .{ .x = xC, .y = yC,
+                    .u = eu + euw * 0.5, .v = ev + evh,
+                    .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
+
+                // UP triangle A,D,C
+                vertices[vi + 3] = .{ .x = xA, .y = yA,
+                    .u = eu + euw * 0.5, .v = ev,
+                    .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
+                vertices[vi + 4] = .{ .x = xD, .y = yD,
+                    .u = eu,             .v = ev + evh,
+                    .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
+                vertices[vi + 5] = .{ .x = xC, .y = yC,
+                    .u = eu + euw,       .v = ev + evh,
+                    .r = c[0], .g = c[1], .b = c[2], .a = c[3] };
+
                 indices[ii + 0] = @intCast(vi + 0);
                 indices[ii + 1] = @intCast(vi + 1);
                 indices[ii + 2] = @intCast(vi + 2);
-                indices[ii + 3] = @intCast(vi + 0);
-                indices[ii + 4] = @intCast(vi + 2);
-                indices[ii + 5] = @intCast(vi + 3);
+                indices[ii + 3] = @intCast(vi + 3);
+                indices[ii + 4] = @intCast(vi + 4);
+                indices[ii + 5] = @intCast(vi + 5);
             }
         }
 
-        self.vertex_count = num_tiles * 4;
-        self.index_count = num_tiles * 6;
+        self.vertex_count = num_tiles * 6;
+        self.index_count  = num_tiles * 6;
 
         gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.vbo);
         gl.bufferData(gl.GL_ARRAY_BUFFER, std.mem.sliceAsBytes(vertices[0..self.vertex_count]), gl.GL_STATIC_DRAW);
@@ -249,14 +301,15 @@ pub const MapRenderer = struct {
         self.shader.setProjection(&camera.projection);
         self.shader.setModelview(&camera.modelview);
 
+        // Vertex layout: x(0) y(4) u(8) v(12) r(16) g(20) b(24) a(28) — 8 floats, 32 bytes
         gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.vbo);
         gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ibo);
-        const stride: i32 = @sizeOf(Vertex);
-        gl.enableVertexAttribArray(0);
+        const stride: i32 = @sizeOf(Vertex); // 8 * 4 = 32 bytes
+        gl.enableVertexAttribArray(0); // a_position
         gl.vertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, 0);
-        gl.enableVertexAttribArray(1);
+        gl.enableVertexAttribArray(1); // a_texcoord
         gl.vertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, 8);
-        gl.enableVertexAttribArray(2);
+        gl.enableVertexAttribArray(2); // a_color
         gl.vertexAttribPointer(2, 4, gl.GL_FLOAT, gl.GL_FALSE, stride, 16);
         gl.drawElements(gl.GL_TRIANGLES, @intCast(self.index_count), gl.GL_UNSIGNED_SHORT, 0);
         gl.disableVertexAttribArray(0);

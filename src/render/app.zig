@@ -381,10 +381,14 @@ pub const App = struct {
         for (self.game.state.buildings.buildings.items) |*b| {
             if (!b.is_done) continue;
 
-            // Use original Settlers isometric projection (same as terrain).
+            // Use original Settlers isometric projection (same as terrain),
+            // including the -4*height 2.5D offset so the building sits on the
+            // raised/lowered terrain surface instead of floating at row*20.
+            const bh: f32 = @floatFromInt(self.game.state.map.getTile(b.pos).height);
             const wx = @as(f32, @floatFromInt(b.pos.x)) * tw -
                 @as(f32, @floatFromInt(b.pos.y)) * hw;
-            const wy = @as(f32, @floatFromInt(b.pos.y)) * th;
+            const wy = @as(f32, @floatFromInt(b.pos.y)) * th -
+                map_renderer_mod.HEIGHT_SCALE * bh;
 
             if (self.atlas_loaded and self.atlas.uploaded) {
                 if (sprite_ids.Building.fromGameBuilding(b.building_type)) |sprite_id| {

@@ -178,26 +178,84 @@ pub const Map = struct {
         return self.getTile(pos).owner == player;
     }
 
-    /// Generate a simple terrain using diamond-square (value noise).
+    /// Generate terrain with a SMOOTH height field.
+    ///
+    /// A smooth height field is essential for correct rendering: the map
+    /// renderer picks a terrain "slope sprite" (one of 8 variants per terrain
+    /// band) based on the height difference to neighboring tiles. If heights
+    /// were fully random per tile, every tile would pick a different slope
+    /// sprite and the terrain would look like a chaotic checkerboard rather
+    /// than a continuous landscape. By smoothing, neighbors share heights, most
+    /// tiles become "flat" (variant 4) using the same base sprite, and the
+    /// terrain blends seamlessly — matching the original Settlers look.
+    ///
     /// Terrain types use only values present in the original C++ terrain enum
     /// (Water, Grass, Tundra, Snow, Desert) — these have actual sprites in the
-    /// AssetMapGround bank (PAK 260-292). Mountain/swamp/lava are not used here
-    /// because no PAK sprites exist for them.
+    /// AssetMapGround bank (PAK 260-292). Mountain/swamp/lava are not used here.
     pub fn generateTerrain(self: *Map, seed: u64) void {
         var prng = std.Random.DefaultPrng.init(seed);
         const r = prng.random();
 
-        const w = self.width;
-        const h = self.height;
+        const w: usize = self.width;
+        const h: usize = self.height;
+        const n = w * h;
 
-        // Fill with random heights and map to terrain types with sprites.
-        // Height progression: water (0-3) → grass (4-9) → tundra (10-12) → snow (13-15)
+        // Working height buffer in f32 for smoothing.
+        const field = self.allocator.alloc(f32, n) catch {
+            // Fallback: flat grass if allocation fails.
+            for (self.tiles) |*t| {
+                t.* = .{ .terrain = .grass, .height = 8 };
+            }
+            return;
+        };
+        defer self.allocator.free(field);
+
+        // 1. Seed with random noise across the full height range.
+        for (field) |*v| v.* = @floatFromInt(r.uintLessThan(u32, 16));
+
+        // 2. Box-blur several passes. Each pass averages a tile with its 4
+        //    orthogonal neighbors, rapidly damping high-frequency noise into
+        //    gentle rolling hills. More passes = smoother / larger features.
+        const tmp = self.allocator.alloc(f32, n) catch field; // reuse on failure
+        defer if (tmp.ptr != field.ptr) self.allocator.free(tmp);
+        if (tmp.ptr != field.ptr) {
+            var pass: usize = 0;
+            while (pass < 6) : (pass += 1) {
+                for (0..h) |y| {
+                    for (0..w) |x| {
+                        var sum: f32 = field[y * w + x];
+                        var cnt: f32 = 1;
+                        if (x > 0)     { sum += field[y * w + (x - 1)]; cnt += 1; }
+                        if (x + 1 < w) { sum += field[y * w + (x + 1)]; cnt += 1; }
+                        if (y > 0)     { sum += field[(y - 1) * w + x]; cnt += 1; }
+                        if (y + 1 < h) { sum += field[(y + 1) * w + x]; cnt += 1; }
+                        tmp[y * w + x] = sum / cnt;
+                    }
+                }
+                @memcpy(field, tmp);
+            }
+        }
+
+        // 3. Renormalize the smoothed field back to the full 0..15 range
+        //    (blurring compresses the range toward the mean).
+        var lo: f32 = field[0];
+        var hi: f32 = field[0];
+        for (field) |v| {
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        const span = @max(hi - lo, 0.0001);
+
+        // 4. Map smoothed heights → tile height + terrain band.
+        //    Bands: water (0-3) → grass (4-9) → tundra (10-12) → snow (13-15)
         for (0..h) |y| {
             for (0..w) |x| {
-                const pos = MapPos{ .x = @intCast(x), .y = @intCast(y) };
-                const height: u4 = @intCast(r.uintLessThan(u32, 16));
-                self.getTile(pos).height = height;
-                const terrain: Terrain = if (height <= TerrainGen.water_threshold)
+                const idx = y * w + x;
+                const norm = (field[idx] - lo) / span; // 0..1
+                const height: u4 = @intFromFloat(@min(15.0, norm * 15.0));
+                const tile = &self.tiles[idx];
+                tile.height = height;
+                tile.terrain = if (height <= TerrainGen.water_threshold)
                     .water
                 else if (height >= 13)
                     .snow
@@ -205,20 +263,19 @@ pub const Map = struct {
                     .tundra
                 else
                     .grass;
-                self.getTile(pos).terrain = terrain;
             }
         }
 
-        // Smooth out isolated water tiles surrounded by walkable land.
+        // 5. Smooth out isolated water tiles surrounded by walkable land.
         for (0..h) |y| {
             for (0..w) |x| {
                 const pos = MapPos{ .x = @intCast(x), .y = @intCast(y) };
                 if (self.getTile(pos).terrain == .water) {
                     const neighbors = self.getAllNeighbors(pos);
                     var walkable_count: u8 = 0;
-                    for (neighbors) |n| {
-                        if (n.eql(MapPos.invalid)) continue;
-                        if (self.getTile(n).terrain.isWalkable()) walkable_count += 1;
+                    for (neighbors) |nb| {
+                        if (nb.eql(MapPos.invalid)) continue;
+                        if (self.getTile(nb).terrain.isWalkable()) walkable_count += 1;
                     }
                     if (walkable_count >= 4) {
                         self.getTile(pos).terrain = .grass;
