@@ -230,6 +230,16 @@ pub const App = struct {
         // Offset 32 (PAK 292) is the water sprite used for all Water terrain types.
         try atlas.loadRange(&pak, &self.decoder, 260, 293);
 
+        // Triangle slope masks: AssetMapMaskUp (PAK 60-140) and AssetMapMaskDown
+        // (PAK 141-221), 81 each. Used as binary stencils by the masked-terrain
+        // shader to carve each ground quad into a sloped triangle.
+        try atlas.loadMaskRange(&pak, &self.decoder, 60, 141);
+        try atlas.loadMaskRange(&pak, &self.decoder, 141, 222);
+
+        // Animated water waves: AssetMapWaves PAK 630-645 (16 frames, 48×19,
+        // transparent sprites). Drawn as an overlay on water tiles.
+        try atlas.loadRange(&pak, &self.decoder, 630, 646);
+
         // Building sprites: specific PAK indices from AssetMapObject
         // (base 1250 + hex offsets from C++ map_building_sprite[])
         const building_ids = [_]u16{
@@ -258,6 +268,13 @@ pub const App = struct {
             sprite_ids.MAP_OBJECT_BASE + 0xc0,  // stock
         };
         try atlas.loadBuildingSprites(&pak, &self.decoder, &building_ids);
+
+        // Building shadows: AssetMapShadow (PAK base 1500) shares the same per-
+        // building offsets as AssetMapObject (PAK base 1250), so each shadow id is
+        // the building sprite id + 250. Decoded as semi-transparent overlays.
+        var shadow_ids: [building_ids.len]u16 = undefined;
+        for (building_ids, 0..) |bid, idx| shadow_ids[idx] = bid + 250;
+        try atlas.loadOverlaySprites(&pak, &self.decoder, &shadow_ids);
 
         atlas.upload() catch |e| {
             std.debug.print("  Atlas upload error: {}\n", .{e});
@@ -334,9 +351,10 @@ pub const App = struct {
 
             gl.clear(gl.GL_COLOR_BUFFER_BIT);
 
-            // Render the hex map
+            // Render the hex map — NEAREST for pixel-exact fidelity to the
+            // original DOS art (the original never blurs terrain).
             if (self.atlas_loaded and self.atlas.uploaded) {
-                self.atlas.bind();
+                self.atlas.setFilter(false); // nearest (binds atlas)
             } else {
                 gl.bindTexture(gl.GL_TEXTURE_2D, fallback_tex);
             }
@@ -345,7 +363,11 @@ pub const App = struct {
             self.shader.setColor(1, 1, 1, 1);
             self.map_renderer.render(&self.camera);
 
-            // Render buildings as colored quads
+            // Buildings & UI use NEAREST so pixel-art sprites stay crisp.
+            if (self.atlas_loaded and self.atlas.uploaded) {
+                self.atlas.setFilter(false); // nearest
+            }
+            self.renderWaves(const_tick);
             self.renderBuildings();
 
             // Render HUD overlay
@@ -370,79 +392,43 @@ pub const App = struct {
         if (self.scroll_down) self.camera.pan(0, speed);
     }
 
+    const BuildingOrder = struct { index: usize, baseline: f32 };
+
     fn renderBuildings(self: *App) void {
         const batcher = &self.sprite_batcher;
         const cam = &self.camera;
         const tw: f32 = map_renderer_mod.TileWidth;
         const th: f32 = map_renderer_mod.TileHeight;
         const hw: f32 = tw / 2.0;
+        const items = self.game.state.buildings.buildings.items;
 
         batcher.begin();
-        for (self.game.state.buildings.buildings.items) |*b| {
-            if (!b.is_done) continue;
 
-            // Use original Settlers isometric projection (same as terrain),
-            // including the -4*height 2.5D offset so the building sits on the
-            // raised/lowered terrain surface instead of floating at row*20.
-            const bh: f32 = @floatFromInt(self.game.state.map.getTile(b.pos).height);
-            const wx = @as(f32, @floatFromInt(b.pos.x)) * tw -
-                @as(f32, @floatFromInt(b.pos.y)) * hw;
-            const wy = @as(f32, @floatFromInt(b.pos.y)) * th -
-                map_renderer_mod.HEIGHT_SCALE * bh;
-
-            if (self.atlas_loaded and self.atlas.uploaded) {
-                if (sprite_ids.Building.fromGameBuilding(b.building_type)) |sprite_id| {
-                    if (self.atlas.get(sprite_id)) |entry| {
-                        // Draw building sprite as axis-aligned rectangle.
-                        // The sprite itself contains the diamond shape with
-                        // transparent corners — same as terrain tiles.
-                        batcher.add(.{
-                            .x = wx - @as(f32, @floatFromInt(entry.pixel_w)) / 2.0,
-                            .y = wy - @as(f32, @floatFromInt(entry.pixel_h)),
-                            .width = @floatFromInt(entry.pixel_w),
-                            .height = @floatFromInt(entry.pixel_h),
-                            .u = entry.u,
-                            .v = entry.v,
-                            .uw = entry.uw,
-                            .vh = entry.vh,
-                            .r = 1.0,
-                            .g = 1.0,
-                            .b = 1.0,
-                            .a = 1.0,
-                        });
-                    } else {
-                        const c = buildingColor(b.building_type);
-                        // Fallback: simple rectangle
-                        batcher.add(.{
-                            .x = wx - hw,
-                            .y = wy - th,
-                            .width = tw,
-                            .height = th * 2,
-                            .u = 0, .v = 0, .uw = 0, .vh = 0,
-                            .r = c[0], .g = c[1], .b = c[2], .a = 0.9,
-                        });
-                    }
-                } else {
-                    const c = buildingColor(b.building_type);
-                    batcher.add(.{
-                        .x = wx - hw,
-                        .y = wy - th,
-                        .width = tw,
-                        .height = th * 2,
-                        .u = 0, .v = 0, .uw = 0, .vh = 0,
-                        .r = c[0], .g = c[1], .b = c[2], .a = 0.9,
-                    });
+        // Sort completed buildings back-to-front by screen baseline so nearer
+        // (lower-on-screen) buildings and their shadows occlude farther ones.
+        const order = std.heap.page_allocator.alloc(BuildingOrder, items.len) catch null;
+        defer if (order) |o| std.heap.page_allocator.free(o);
+        if (order) |o| {
+            var n: usize = 0;
+            for (items, 0..) |*b, i| {
+                if (!b.is_done) continue;
+                const bh: f32 = @floatFromInt(self.game.state.map.getTile(b.pos).height);
+                const wy = @as(f32, @floatFromInt(b.pos.y)) * th -
+                    map_renderer_mod.HEIGHT_SCALE * bh;
+                o[n] = .{ .index = i, .baseline = wy };
+                n += 1;
+            }
+            std.mem.sort(BuildingOrder, o[0..n], {}, struct {
+                fn lt(_: void, a: BuildingOrder, c: BuildingOrder) bool {
+                    return a.baseline < c.baseline;
                 }
-            } else {
-                const c = buildingColor(b.building_type);
-                batcher.add(.{
-                    .x = wx - hw,
-                    .y = wy - th,
-                    .width = tw,
-                    .height = th * 2,
-                    .u = 0, .v = 0, .uw = 0, .vh = 0,
-                    .r = c[0], .g = c[1], .b = c[2], .a = 0.9,
-                });
+            }.lt);
+            for (o[0..n]) |e| self.drawBuilding(batcher, &items[e.index], tw, th, hw);
+        } else {
+            // Allocation failed: draw unsorted (still correct, just possible overlap).
+            for (items) |*b| {
+                if (!b.is_done) continue;
+                self.drawBuilding(batcher, b, tw, th, hw);
             }
         }
 
@@ -453,6 +439,115 @@ pub const App = struct {
             var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
             batcher.render(&self.shader, &white_tex, cam);
         }
+    }
+
+    /// Queue one building into the sprite batcher: its semi-transparent shadow
+    /// first (underneath), then the building sprite, both placed at the building's
+    /// map pixel + the sprite's own hotspot offset (matches the original use_off,
+    /// keeps shadow and building aligned). Falls back to a colored rectangle when
+    /// no sprite is available.
+    fn drawBuilding(self: *App, batcher: *SpriteBatcher, b: anytype, tw: f32, th: f32, hw: f32) void {
+        const bh: f32 = @floatFromInt(self.game.state.map.getTile(b.pos).height);
+        const wx = @as(f32, @floatFromInt(b.pos.x)) * tw -
+            @as(f32, @floatFromInt(b.pos.y)) * hw;
+        const wy = @as(f32, @floatFromInt(b.pos.y)) * th -
+            map_renderer_mod.HEIGHT_SCALE * bh;
+
+        const sid = if (self.atlas_loaded and self.atlas.uploaded)
+            sprite_ids.Building.fromGameBuilding(b.building_type)
+        else
+            null;
+
+        if (sid) |sprite_id| {
+            if (self.atlas.get(sprite_id)) |entry| {
+                // Shadow (PAK building id + 250), drawn under the building.
+                if (self.atlas.get(sprite_id + 250)) |sh| {
+                    batcher.add(.{
+                        .x = wx + @as(f32, @floatFromInt(sh.off_x)),
+                        .y = wy + @as(f32, @floatFromInt(sh.off_y)),
+                        .width = @floatFromInt(sh.pixel_w),
+                        .height = @floatFromInt(sh.pixel_h),
+                        .u = sh.u, .v = sh.v, .uw = sh.uw, .vh = sh.vh,
+                        .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0,
+                    });
+                }
+                // Building sprite at its hotspot offset.
+                batcher.add(.{
+                    .x = wx + @as(f32, @floatFromInt(entry.off_x)),
+                    .y = wy + @as(f32, @floatFromInt(entry.off_y)),
+                    .width = @floatFromInt(entry.pixel_w),
+                    .height = @floatFromInt(entry.pixel_h),
+                    .u = entry.u, .v = entry.v, .uw = entry.uw, .vh = entry.vh,
+                    .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0,
+                });
+                return;
+            }
+        }
+
+        // Fallback: colored rectangle.
+        const c = buildingColor(b.building_type);
+        batcher.add(.{
+            .x = wx - hw,
+            .y = wy - th,
+            .width = tw,
+            .height = th * 2,
+            .u = 0, .v = 0, .uw = 0, .vh = 0,
+            .r = c[0], .g = c[1], .b = c[2], .a = 0.9,
+        });
+    }
+
+    /// Draw animated water waves (AssetMapWaves) over every water tile. Frame is
+    /// selected per-tile by the original formula ((pos ^ 5) + (tick >> 3)) & 0xf,
+    /// giving 16 cycling frames (PAK 630-645).
+    fn renderWaves(self: *App, tick: u64) void {
+        if (!(self.atlas_loaded and self.atlas.uploaded)) return;
+        const batcher = &self.sprite_batcher;
+        const cam = &self.camera;
+        const tw: f32 = map_renderer_mod.TileWidth;
+        const th: f32 = map_renderer_mod.TileHeight;
+        const hw: f32 = tw / 2.0;
+        const map = &self.game.state.map;
+
+        // A wave sprite is 48×19 anchored at (wx-16, wy); its footprint covers the
+        // tile plus its right / down / down-right neighbours. Only animate water
+        // whose whole footprint is also water, otherwise the sprite "floods" the
+        // adjacent grass. Shoreline water stays static (no spill).
+        const isWater = struct {
+            fn at(m: *core.map.Map, x: usize, y: usize) bool {
+                if (x >= m.width or y >= m.height) return false;
+                return m.getTileXY(@intCast(x), @intCast(y)).terrain == .water;
+            }
+        }.at;
+
+        batcher.begin();
+        var drew = false;
+        for (0..map.height) |yy| {
+            for (0..map.width) |xx| {
+                const tile = map.getTileXY(@intCast(xx), @intCast(yy));
+                if (tile.terrain != .water) continue;
+                // Skip shoreline tiles to avoid waves spilling onto land.
+                if (!isWater(map, xx + 1, yy) or !isWater(map, xx, yy + 1) or
+                    !isWater(map, xx + 1, yy + 1)) continue;
+                const pos: u64 = @as(u64, yy) * map.width + xx;
+                const frame: u16 = @intCast(((pos ^ 5) + (tick >> 3)) & 0xf);
+                const entry = self.atlas.get(630 + frame) orelse continue;
+                const wx = @as(f32, @floatFromInt(xx)) * tw - @as(f32, @floatFromInt(yy)) * hw;
+                const wy = @as(f32, @floatFromInt(yy)) * th -
+                    map_renderer_mod.HEIGHT_SCALE * @as(f32, @floatFromInt(tile.height));
+                batcher.add(.{
+                    .x = wx - hw,
+                    .y = wy,
+                    .width = @floatFromInt(entry.pixel_w),
+                    .height = @floatFromInt(entry.pixel_h),
+                    .u = entry.u, .v = entry.v, .uw = entry.uw, .vh = entry.vh,
+                    .r = 1, .g = 1, .b = 1, .a = 1,
+                });
+                drew = true;
+            }
+        }
+        if (!drew) return;
+        var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
+        batcher.render(&self.shader, &atlas_tex, cam);
     }
 
     fn buildingColor(b: Building) [3]f32 {

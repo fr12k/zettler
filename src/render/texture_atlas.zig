@@ -19,6 +19,7 @@ pub const AtlasEntry = struct {
     uw: f32, vh: f32,
     pixel_w: u32, pixel_h: u32,
     atlas_x: u32, atlas_y: u32,
+    off_x: i16 = 0, off_y: i16 = 0, // sprite hotspot offset (needed for masks)
 };
 
 /// Maximum number of sprites that can be packed into the atlas.
@@ -80,11 +81,34 @@ pub const TextureAtlas = struct {
         }
         if (self.cursor_y + ph > ATLAS_SIZE) return error.AtlasFull;
 
+        const base_x = self.cursor_x + ATLAS_MARGIN;
+        const base_y = self.cursor_y + ATLAS_MARGIN;
         for (0..h) |sy| {
             for (0..w) |sx| {
-                self.pixels[(self.cursor_y + ATLAS_MARGIN + sy) * ATLAS_SIZE + (self.cursor_x + ATLAS_MARGIN + sx)] =
+                self.pixels[(base_y + sy) * ATLAS_SIZE + (base_x + sx)] =
                     sprite.pixels[sy * w + sx];
             }
+        }
+
+        // Edge-replication padding into the 1px margin. With GL_LINEAR sampling,
+        // a fragment near a sprite edge would otherwise blend into the neighbor
+        // sprite (or transparent margin) and show a dark seam. Copying the border
+        // pixels outward makes the blend sample a duplicate of the edge instead.
+        if (w > 0 and h > 0) {
+            for (0..h) |sy| {
+                const row = base_y + sy;
+                self.pixels[row * ATLAS_SIZE + (base_x - 1)] = sprite.pixels[sy * w + 0];
+                self.pixels[row * ATLAS_SIZE + (base_x + w)] = sprite.pixels[sy * w + (w - 1)];
+            }
+            for (0..w) |sx| {
+                const col = base_x + sx;
+                self.pixels[(base_y - 1) * ATLAS_SIZE + col] = sprite.pixels[0 * w + sx];
+                self.pixels[(base_y + h) * ATLAS_SIZE + col] = sprite.pixels[(h - 1) * w + sx];
+            }
+            self.pixels[(base_y - 1) * ATLAS_SIZE + (base_x - 1)] = sprite.pixels[0];
+            self.pixels[(base_y - 1) * ATLAS_SIZE + (base_x + w)] = sprite.pixels[w - 1];
+            self.pixels[(base_y + h) * ATLAS_SIZE + (base_x - 1)] = sprite.pixels[(h - 1) * w + 0];
+            self.pixels[(base_y + h) * ATLAS_SIZE + (base_x + w)] = sprite.pixels[(h - 1) * w + (w - 1)];
         }
         self.row_height = @max(self.row_height, ph);
 
@@ -96,6 +120,7 @@ pub const TextureAtlas = struct {
             .vh = @as(f32, @floatFromInt(h)) / fs,
             .pixel_w = w, .pixel_h = h,
             .atlas_x = self.cursor_x, .atlas_y = self.cursor_y,
+            .off_x = sprite.offset_x, .off_y = sprite.offset_y,
         };
         try self.entries.put(sprite_id, entry);
         self.cursor_x += pw;
@@ -122,9 +147,31 @@ pub const TextureAtlas = struct {
         if (self.gl_texture != 0) gl.bindTexture(gl.GL_TEXTURE_2D, self.gl_texture);
     }
 
+    /// Switch the atlas sampling filter. Terrain uses linear (smooth tile edges);
+    /// sprites/UI use nearest (crisp pixel art). Binds the atlas as a side effect.
+    pub fn setFilter(self: *TextureAtlas, linear: bool) void {
+        if (self.gl_texture == 0) return;
+        gl.bindTexture(gl.GL_TEXTURE_2D, self.gl_texture);
+        const f: gl.GLint = if (linear) @intCast(gl.GL_LINEAR) else @intCast(gl.GL_NEAREST);
+        gl.texParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, f);
+        gl.texParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, f);
+    }
+
     pub fn get(self: *TextureAtlas, sprite_id: u16) ?AtlasEntry { return self.entries.get(sprite_id); }
     pub fn has(self: *TextureAtlas, sprite_id: u16) bool { return self.entries.contains(sprite_id); }
     pub fn count(self: TextureAtlas) usize { return self.entries.count(); }
+
+    /// Load MASK sprites (AssetMapMaskUp PAK 60-140, AssetMapMaskDown 141-221)
+    /// using the RLE mask decoder. Packed under their PAK index as the key.
+    pub fn loadMaskRange(self: *TextureAtlas, pak: *const PakFile, decoder: *BmpDecoder, start: u16, end: u16) !void {
+        var i = start;
+        while (i < end and i < pak.fileCount()) : (i += 1) {
+            const raw = pak.getFile(i) catch continue;
+            var sprite = decoder.decodeMask(raw) catch continue;
+            defer sprite.deinit(self.allocator);
+            _ = try self.packSprite(i, &sprite);
+        }
+    }
 
     /// Load terrain tiles from PAK and pack into atlas.
     pub fn loadTerrainSprites(self: *TextureAtlas, pak: *PakFile, decoder: *BmpDecoder) !void {
@@ -143,6 +190,18 @@ pub const TextureAtlas = struct {
             if (id >= pak.fileCount()) continue;
             const raw = pak.getFile(id) catch continue;
             var sprite = decoder.decode(raw) catch continue;
+            defer sprite.deinit(self.allocator);
+            _ = try self.packSprite(id, &sprite);
+        }
+    }
+
+    /// Load OVERLAY (shadow) sprites from PAK for given sprite IDs, decoded as
+    /// semi-transparent shadow stencils (AssetMapShadow / AssetSerfShadow).
+    pub fn loadOverlaySprites(self: *TextureAtlas, pak: *const PakFile, decoder: *BmpDecoder, ids: []const u16) !void {
+        for (ids) |id| {
+            if (id >= pak.fileCount()) continue;
+            const raw = pak.getFile(id) catch continue;
+            var sprite = decoder.decodeOverlay(raw) catch continue;
             defer sprite.deinit(self.allocator);
             _ = try self.packSprite(id, &sprite);
         }
