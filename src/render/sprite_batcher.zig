@@ -9,8 +9,9 @@ const Shader = @import("Shader.zig").Shader;
 const Texture = @import("Texture.zig").Texture;
 const Camera = @import("Camera.zig").Camera;
 
-/// Maximum number of sprites per batch.
-pub const MAX_SPRITES: usize = 4096;
+/// Maximum number of sprites per batch. Large enough to hold a whole map's
+/// worth of trees/rocks + buildings (each with a shadow) in one scene batch.
+pub const MAX_SPRITES: usize = 16384;
 pub const MAX_VERTICES: usize = MAX_SPRITES * 4;
 pub const MAX_INDICES: usize = MAX_SPRITES * 6;
 

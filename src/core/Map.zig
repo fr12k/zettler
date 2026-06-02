@@ -39,8 +39,35 @@ pub const Terrain = enum(u4) {
         return !self.isWater() and !self.isMountain();
     }
 
+    /// Whether normal (non-mine) buildings can be placed here: grass (and flat
+    /// desert sand). Matches freeserf's can_build_small (grass only); tundra and
+    /// snow are the mountain band reserved for mines, water is never buildable.
     pub fn isBuildable(self: Terrain) bool {
-        return self == .grass or self == .tundra or self == .desert;
+        return self == .grass or self == .desert;
+    }
+
+    /// Whether a mine can be placed here. Mines dig into rock, so they go on the
+    /// rocky mountain band — `tundra` (the grey high ground) and the explicit
+    /// mountain terrains. Snow caps are excluded (too high), as are grass/water.
+    /// (generateTerrain emits `tundra` as the rocky mountain rather than the
+    /// `mountain` enum values, so tundra is the practical mining terrain.)
+    pub fn isMineable(self: Terrain) bool {
+        return self == .tundra or self.isMountain();
+    }
+};
+
+/// A standing object occupying a map tile (resource the gatherers harvest, or
+/// scenery). Mirrors the freeserf Map::Object families we care about for the
+/// economy. `variant` (0..7) selects the sprite within the family for visual
+/// variety; see app.zig drawMapObjects for the AssetMapObject offsets.
+pub const MapObject = enum(u8) {
+    none = 0,
+    tree = 1, // deciduous — felled by lumberjacks for wood
+    pine = 2, // coniferous — also felled for wood
+    stone = 3, // rock — cut by stonecutters for stone
+
+    pub fn isTree(self: MapObject) bool {
+        return self == .tree or self == .pine;
     }
 };
 
@@ -57,6 +84,10 @@ pub const Tile = struct {
     serf_index: GameObjectIndex = GameObjectIndex.invalid,
     ground_resource: u8 = 0,
     ground_resource_type: u8 = 0,
+    /// Standing object on the tile (tree/rock/none). Blocks building placement.
+    object: MapObject = .none,
+    /// Sprite variant within the object family (0..7).
+    object_variant: u8 = 0,
 };
 
 /// Terrain generation constants.
@@ -283,6 +314,70 @@ pub const Map = struct {
                 }
             }
         }
+
+        // 6. Scatter harvestable objects: trees (deciduous + pine) on grass,
+        //    rocks on the rocky tundra band. These are what gatherers consume.
+        self.populateObjects(seed ^ 0x5eed);
+    }
+
+    /// Scatter trees and rocks across the map. Trees go on grass (so foresters
+    /// and lumberjacks have something to work with); rocks go on the tundra
+    /// "mountain" band near the mines. Density is intentionally moderate so the
+    /// map stays buildable. Safe to call once after generateTerrain.
+    pub fn populateObjects(self: *Map, seed: u64) void {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        for (0..self.height) |y| {
+            for (0..self.width) |x| {
+                const tile = self.getTileXY(@intCast(x), @intCast(y));
+                if (tile.object != .none) continue;
+                switch (tile.terrain) {
+                    .grass => {
+                        // ~22% tree cover, mixed deciduous/pine.
+                        if (r.uintLessThan(u8, 100) < 22) {
+                            tile.object = if (r.boolean()) .tree else .pine;
+                            tile.object_variant = r.uintLessThan(u8, 8);
+                        }
+                    },
+                    .tundra => {
+                        // ~18% rock cover on the rocky mountain band.
+                        if (r.uintLessThan(u8, 100) < 18) {
+                            tile.object = .stone;
+                            tile.object_variant = r.uintLessThan(u8, 8);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    /// Count the harvestable objects of a family within `radius` tiles of `pos`,
+    /// and return the nearest such tile (for gatherers). `want_tree` true → trees
+    /// (deciduous/pine); false → rocks. Returns null if none in range.
+    pub fn findNearestObject(self: *Map, pos: MapPos, radius: i32, want_tree: bool) ?MapPos {
+        var best: ?MapPos = null;
+        var best_d: i32 = std.math.maxInt(i32);
+        const px: i32 = @intCast(pos.x);
+        const py: i32 = @intCast(pos.y);
+        var dy: i32 = -radius;
+        while (dy <= radius) : (dy += 1) {
+            var dx: i32 = -radius;
+            while (dx <= radius) : (dx += 1) {
+                const tx = px + dx;
+                const ty = py + dy;
+                if (tx < 0 or ty < 0 or tx >= self.width or ty >= self.height) continue;
+                const t = self.getTileXY(@intCast(tx), @intCast(ty));
+                const match = if (want_tree) t.object.isTree() else (t.object == .stone);
+                if (!match) continue;
+                const d = dx * dx + dy * dy;
+                if (d < best_d) {
+                    best_d = d;
+                    best = MapPos{ .x = @intCast(tx), .y = @intCast(ty) };
+                }
+            }
+        }
+        return best;
     }
 };
 

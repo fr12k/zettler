@@ -81,6 +81,35 @@ pub const Building = struct {
     pub const fortress: u16 = MAP_OBJECT_BASE + 0x98;  // PAK 1402
     pub const gold_smelter: u16 = MAP_OBJECT_BASE + 0x9f;  // PAK 1409 (GoldSmelter)
 
+    // Construction sprites (shared by all buildings, from C++ viewport.cc
+    // draw_building_unfinished): the building "plan" cross drawn at progress 0,
+    // and the corner stone drawn while the wooden scaffold frame is going up.
+    pub const PLAN: u16 = MAP_OBJECT_BASE + 0x90;          // PAK 1394
+    pub const CORNER_STONE: u16 = MAP_OBJECT_BASE + 0x91;  // PAK 1395
+
+    /// The scaffold "frame" sprite shown while a building is under construction.
+    /// Offsets come from C++ map_building_frame_sprite[] (viewport.cc), mapped
+    /// by building NAME (the Zig and C++ enums are ordered differently).
+    pub fn frameSprite(b: core.Building) ?u16 {
+        const off: u16 = switch (b) {
+            .fisher, .lumberjack, .boatbuilder, .stonecutter, .forester => 0xba,
+            .granite_mine, .coal_mine, .iron_mine, .gold_mine => 0xb9,
+            .stock => 0xc1,
+            .farm, .pig_farm => 0xb1,
+            .slaughterhouse, .armory => 0xb8,
+            .mill => 0xbb,
+            .bakery => 0xb7,
+            .sawmill => 0xb5,
+            .iron_smelter => 0xb6,
+            .toolmaker => 0xb0,
+            .tower => 0xb3,
+            .fortress => 0xaf,
+            .gold_smelter => 0xb4,
+            else => return null,
+        };
+        return MAP_OBJECT_BASE + off;
+    }
+
     // Brewery and winery are not in the C++ freeserf building enum.
     // They may have different sprite IDs in the C#-derived enum.
     // For now, they return null (colored fallback).

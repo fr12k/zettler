@@ -13,8 +13,10 @@ const Terrain = @import("Map.zig").Terrain;
 const PlayerState = @import("PlayerState.zig").PlayerState;
 const PlayerStates = @import("PlayerState.zig").PlayerStates;
 const BuildingState = @import("BuildingState.zig").BuildingState;
+const BuildingManager = @import("Building.zig").BuildingManager;
 const FlagState = @import("FlagState.zig").FlagState;
 const SerfStateData = @import("SerfState.zig").SerfStateData;
+const SerfState = enums.SerfState;
 const Inventory = @import("Inventory.zig").Inventory;
 const Pathfinder = @import("Pathfinder.zig").Pathfinder;
 
@@ -129,33 +131,140 @@ pub const Game = struct {
         self.updateInventories(game_tick);
     }
 
-    /// Update all buildings.
+    /// Update all buildings: advance construction, staff finished buildings with
+    /// a worker serf, and run production. Iterates by index because production
+    /// may spawn serfs / mutate the map.
     fn updateBuildings(self: *Game, game_tick: u64) void {
-        for (self.state.buildings.buildings.items, 0..) |*building, i| {
-            _ = i;
+        var i: usize = 0;
+        const n = self.state.buildings.buildings.items.len;
+        while (i < n) : (i += 1) {
+            const building = &self.state.buildings.buildings.items[i];
             if (!building.is_done) {
-                // Construction in progress
+                // Construction in progress.
                 if (game_tick % 5 == 0) {
                     building.progress += 1;
-                    if (building.progress >= 100) {
-                        building.is_done = true;
-                    }
+                    if (building.progress >= 100) building.is_done = true;
                 }
                 continue;
             }
 
             if (building.is_burning) continue;
+            if (!building.building_type.isProducer()) continue;
 
-            // Production cycle for producer buildings
-            if (building.building_type.isProducer()) {
-                building.production_tick += 1;
-                const prod_time = getProductionTime(building.building_type);
-                if (prod_time > 0 and building.production_tick >= prod_time) {
-                    building.production_tick = 0;
-                    building.production_count += 1;
+            // Staff the finished building with a worker serf if it has none yet
+            // (serf assignment: an idle worker is created for the unstaffed
+            // building). Best effort — out of memory just skips this tick.
+            if (!building.serf_index.isValid()) {
+                self.assignWorker(GameObjectIndex{ .index = @intCast(i) }) catch {};
+                continue;
+            }
+
+            // Production cycle. For easier testing buildings need no input
+            // resources; they just produce their output on a timer. Gatherers
+            // additionally need (and consume) a nearby map object.
+            building.production_tick += 1;
+            const prod_time = getProductionTime(building.building_type);
+            if (prod_time == 0 or building.production_tick < prod_time) continue;
+
+            if (self.tryProduce(building)) {
+                building.production_tick = 0;
+                building.production_count +%= 1;
+            } else {
+                // Stalled (e.g. no tree/rock/water in range) — keep the timer
+                // pinned so it retries promptly next tick.
+                building.production_tick = prod_time;
+            }
+        }
+    }
+
+    /// Spawn and assign a worker serf to a finished, unstaffed building.
+    fn assignWorker(self: *Game, building_idx: GameObjectIndex) !void {
+        const b = self.state.buildings.get(building_idx);
+        const serf = SerfStateData{
+            .pos = b.pos,
+            .serf_type = BuildingManager.getRequiredSerfType(b.building_type),
+            .player = b.player,
+            .state = workerStateFor(b.building_type),
+            .building_index = building_idx,
+        };
+        const sidx = try self.state.serfs.add(self.allocator, serf);
+        self.state.buildings.get(building_idx).serf_index = sidx;
+    }
+
+    /// Run one production cycle for a staffed building. Returns false if the
+    /// building stalled (gatherer with no resource in range), true if it
+    /// produced. Output is delivered straight to the owning player's stock for
+    /// now (simplified — no transporter walk yet).
+    fn tryProduce(self: *Game, building: *BuildingState) bool {
+        const map = &self.state.map;
+        const radius = 5;
+        switch (building.building_type) {
+            // Lumberjack: fell the nearest tree (removing it).
+            .lumberjack => {
+                const t = map.findNearestObject(building.pos, radius, true) orelse return false;
+                map.getTile(t).object = .none;
+            },
+            // Stonecutter: cut the nearest rock (removing it).
+            .stonecutter => {
+                const t = map.findNearestObject(building.pos, radius, false) orelse return false;
+                map.getTile(t).object = .none;
+            },
+            // Forester: plant a tree on a nearby empty grass tile — produces no
+            // resource, it just replenishes the forest for lumberjacks.
+            .forester => {
+                self.plantTreeNear(building.pos, radius);
+                return true;
+            },
+            // Fisher: needs open water within reach (water is not consumed).
+            .fisher => {
+                if (!self.hasWaterNear(building.pos, 3)) return false;
+            },
+            else => {},
+        }
+
+        if (getProducedResource(building.building_type)) |res| {
+            if (building.player < MAX_PLAYERS) {
+                const p = &self.state.players.players[building.player];
+                p.resources[@intFromEnum(res)] +|= 1;
+            }
+        }
+        return true;
+    }
+
+    /// Plant a tree on the first empty grass tile within `radius` of `pos`.
+    fn plantTreeNear(self: *Game, pos: MapPos, radius: i32) void {
+        const map = &self.state.map;
+        var dy: i32 = -radius;
+        while (dy <= radius) : (dy += 1) {
+            var dx: i32 = -radius;
+            while (dx <= radius) : (dx += 1) {
+                const tx = @as(i32, @intCast(pos.x)) + dx;
+                const ty = @as(i32, @intCast(pos.y)) + dy;
+                if (tx < 0 or ty < 0 or tx >= map.width or ty >= map.height) continue;
+                const t = map.getTileXY(@intCast(tx), @intCast(ty));
+                if (t.terrain == .grass and t.object == .none and !t.has_building and !t.has_flag) {
+                    t.object = .pine;
+                    t.object_variant = @intCast(@as(u32, @bitCast(dx *% 7 +% dy)) & 7);
+                    return;
                 }
             }
         }
+    }
+
+    /// True if any tile within `radius` of `pos` is water (for the fisher).
+    fn hasWaterNear(self: *Game, pos: MapPos, radius: i32) bool {
+        const map = &self.state.map;
+        var dy: i32 = -radius;
+        while (dy <= radius) : (dy += 1) {
+            var dx: i32 = -radius;
+            while (dx <= radius) : (dx += 1) {
+                const tx = @as(i32, @intCast(pos.x)) + dx;
+                const ty = @as(i32, @intCast(pos.y)) + dy;
+                if (tx < 0 or ty < 0 or tx >= map.width or ty >= map.height) continue;
+                if (map.getTileXY(@intCast(tx), @intCast(ty)).terrain.isWater()) return true;
+            }
+        }
+        return false;
     }
 
     /// Update all flags (transporter scheduling).
@@ -186,6 +295,32 @@ pub const Game = struct {
     /// Get the current game map.
     pub fn getMap(self: *Game) *Map {
         return &self.state.map;
+    }
+
+    /// The serf FSM state a worker occupies when staffing each building type.
+    /// (Production is currently driven by the building, not the serf FSM; this
+    /// is the semantic/animation state for the assigned worker.)
+    fn workerStateFor(b: Building) SerfState {
+        return switch (b) {
+            .lumberjack => .lumberjack_felling,
+            .stonecutter => .stonecutter_mining,
+            .fisher => .fisher_fishing,
+            .forester => .forester_planting,
+            .farm => .farmer_planting,
+            .mill => .miller_grinding,
+            .bakery => .baker_baking,
+            .sawmill => .sawmiller_sawing,
+            .slaughterhouse => .butcher_butchering,
+            .pig_farm => .pig_farmer_feeding,
+            .brewery => .brewer_brewing,
+            .winery => .winemaker_making_wine,
+            .iron_smelter, .gold_smelter => .smelter_smelting,
+            .toolmaker => .toolmaker_making_tools,
+            .armory => .armor_smith_forging,
+            .boatbuilder => .boatbuilder_building,
+            .coal_mine, .iron_mine, .gold_mine, .granite_mine => .miner_mining,
+            else => .idle_in_stock,
+        };
     }
 
     /// Get production time for a building type.
@@ -270,10 +405,18 @@ pub const Game = struct {
         if (!self.state.map.isValidPos(pos)) return null;
         const tile = self.state.map.getTile(pos);
         if (tile.has_building) return null;
-        if (!tile.terrain.isBuildable() and !tile.terrain.isMountain()) return null;
+        // The tile must be clear of standing objects (trees/rocks), like
+        // freeserf's map_space_from_obj check.
+        if (tile.object != .none) return null;
 
-        // Mines require mountain terrain
-        if (building_type.isMine() and !tile.terrain.isMountain()) return null;
+        // Mines go on rocky high ground (snow/mountain); every other building
+        // goes on buildable land. Water satisfies neither, so nothing is ever
+        // placed on water.
+        if (building_type.isMine()) {
+            if (!tile.terrain.isMineable()) return null;
+        } else {
+            if (!tile.terrain.isBuildable()) return null;
+        }
 
         tile.has_building = true;
         tile.owner = player;
@@ -288,6 +431,23 @@ pub const Game = struct {
 
         const idx = try self.state.buildings.add(self.allocator, building);
         tile.building_index = idx;
+
+        // Drop the building's flag on the tile down-right of it (as freeserf
+        // does), so the building can be connected into the road network. Best
+        // effort — if that tile is unavailable the building simply has no flag.
+        const flag_pos = pos.move(.down_right);
+        if (self.state.map.isValidPos(flag_pos)) {
+            const ftile = self.state.map.getTile(flag_pos);
+            if (!ftile.has_flag and !ftile.has_building and !ftile.terrain.isWater()) {
+                // Clear any tree/rock on the flag spot so the building always
+                // gets a flag (and can be connected by roads).
+                ftile.object = .none;
+                if (self.placeFlag(flag_pos, player) catch null) |fidx| {
+                    self.state.buildings.get(idx).flag_index = fidx;
+                    self.state.flags.get(fidx).building_index = idx;
+                }
+            }
+        }
 
         return idx;
     }
@@ -309,6 +469,50 @@ pub const Game = struct {
         const idx = try self.state.flags.add(self.allocator, flag);
         tile.flag_index = idx;
         return idx;
+    }
+
+    /// Build a road between two existing flags along `path` (a list of direction
+    /// steps leaving `from`). Marks the intermediate tiles as road and links the
+    /// two flags in the flag graph. Returns false if the endpoints aren't flags
+    /// or the path doesn't connect them. (Simplified: no wood cost, no per-tile
+    /// passability re-check beyond "not a building".)
+    pub fn buildRoad(self: *Game, from: MapPos, to: MapPos, path: []const u8) bool {
+        const map = &self.state.map;
+        if (path.len == 0) return false;
+        const ftile = map.getTile(from);
+        const ttile = map.getTile(to);
+        if (!ftile.has_flag or !ttile.has_flag) return false;
+
+        // Validate the path connects from→to and isn't blocked, before mutating.
+        var p = from;
+        for (path, 0..) |d, i| {
+            if (d >= Direction.count) return false;
+            p = p.move(@enumFromInt(d));
+            if (!map.isValidPos(p)) return false;
+            if (i < path.len - 1 and map.getTile(p).has_building) return false;
+        }
+        if (!p.eql(to)) return false;
+
+        // Mark intermediate tiles as road.
+        p = from;
+        for (path, 0..) |d, i| {
+            p = p.move(@enumFromInt(d));
+            if (i < path.len - 1) map.getTile(p).has_road = true;
+        }
+
+        // Link the two flags in the graph (both directions).
+        const from_idx = ftile.flag_index;
+        const to_idx = ttile.flag_index;
+        if (from_idx.isValid() and to_idx.isValid()) {
+            const first_dir: usize = @intCast(path[0]);
+            const back_dir: Direction = (@as(Direction, @enumFromInt(path[path.len - 1]))).opposite();
+            const seg_len: u8 = @intCast(@min(path.len, 255));
+            self.state.flags.get(from_idx).next[first_dir] = to_idx;
+            self.state.flags.get(from_idx).length[first_dir] = seg_len;
+            self.state.flags.get(to_idx).next[@intFromEnum(back_dir)] = from_idx;
+            self.state.flags.get(to_idx).length[@intFromEnum(back_dir)] = seg_len;
+        }
+        return true;
     }
 };
 
@@ -340,4 +544,67 @@ test "Game production time" {
     try std.testing.expectEqual(@as(u16, 40), Game.getProductionTime(.lumberjack));
     try std.testing.expectEqual(@as(u16, 120), Game.getProductionTime(.farm));
     try std.testing.expectEqual(@as(u16, 0), Game.getProductionTime(.none));
+}
+
+test "Terrain generation scatters objects" {
+    var game = try Game.init(std.testing.allocator, 48, 48, 1);
+    defer game.deinit();
+    var objects: usize = 0;
+    for (game.state.map.tiles) |t| {
+        if (t.object != .none) objects += 1;
+    }
+    try std.testing.expect(objects > 0);
+}
+
+test "Cannot build on a tile with an object" {
+    var game = try Game.init(std.testing.allocator, 16, 16, 1);
+    defer game.deinit();
+    const pos = types.MapPos{ .x = 8, .y = 8 };
+    const tile = game.state.map.getTile(pos);
+    tile.terrain = .grass;
+    tile.object = .tree;
+    try std.testing.expect((try game.placeBuilding(pos, .lumberjack, 0)) == null);
+    tile.object = .none;
+    try std.testing.expect((try game.placeBuilding(pos, .lumberjack, 0)) != null);
+}
+
+test "Staffed lumberjack fells a nearby tree and yields wood" {
+    var game = try Game.init(std.testing.allocator, 16, 16, 1);
+    defer game.deinit();
+    game.state.players.setPlayerCount(1);
+    game.state.speed = 1;
+
+    const pos = types.MapPos{ .x = 8, .y = 8 };
+    const tile = game.state.map.getTile(pos);
+    tile.terrain = .grass;
+    tile.object = .none;
+    const idx = (try game.placeBuilding(pos, .lumberjack, 0)).?;
+    game.state.buildings.get(idx).is_done = true; // skip construction for the test
+
+    const tree_pos = types.MapPos{ .x = 9, .y = 8 };
+    game.state.map.getTile(tree_pos).object = .tree;
+
+    var t: u64 = 1;
+    while (t <= 200) : (t += 1) game.tick(t);
+
+    try std.testing.expect(game.state.buildings.get(idx).serf_index.isValid());
+    try std.testing.expect(game.state.players.players[0].resources[@intFromEnum(Resource.wood)] > 0);
+    try std.testing.expectEqual(@import("Map.zig").MapObject.none, game.state.map.getTile(tree_pos).object);
+}
+
+test "buildRoad links two flags and marks the path" {
+    var game = try Game.init(std.testing.allocator, 16, 16, 1);
+    defer game.deinit();
+    const a = types.MapPos{ .x = 4, .y = 4 };
+    const b = types.MapPos{ .x = 6, .y = 4 };
+    for ([_]types.MapPos{ a, b, .{ .x = 5, .y = 4 } }) |p| {
+        const tl = game.state.map.getTile(p);
+        tl.terrain = .grass;
+        tl.object = .none;
+    }
+    _ = try game.placeFlag(a, 0);
+    _ = try game.placeFlag(b, 0);
+    const path = [_]u8{ @intFromEnum(Direction.right), @intFromEnum(Direction.right) };
+    try std.testing.expect(game.buildRoad(a, b, &path));
+    try std.testing.expect(game.state.map.getTile(.{ .x = 5, .y = 4 }).has_road);
 }

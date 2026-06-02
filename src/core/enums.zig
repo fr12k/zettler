@@ -115,6 +115,7 @@ pub const Resource = enum(u8) {
             .shield => "Shield",
             .serf => "Serf",
             .knight => "Knight",
+            .count => "(count)",
         };
     }
 

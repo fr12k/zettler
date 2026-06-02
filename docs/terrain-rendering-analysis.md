@@ -166,14 +166,15 @@ triangle alpha. Filtering is nearest — the look stays crisp pixel art.
 
 | Mechanism | Original | Zettler |
 |---|---|---|
-| Mesh | per-position triangle mesh | per-tile 2 triangles (6 verts) |
+| Mesh | per-position triangle mesh | per-tile 4-vert parallelogram (P,R,Dn,DR) → 2 triangles |
 | Tile size | 32×20 px | `TileWidth=32`, `TileHeight=20` |
 | Projection | `col*32 - row*16`, `row*20 - 4h` | same (`map_renderer.zig`) |
 | 2.5D relief | `-4*height` per vertex | `HEIGHT_SCALE=4` per corner, per grid pos |
-| Ground sprites | `tri_spr[]`, PAK 260–292 | `terrainSpriteId()` + `TRI_MASK_UP` |
-| Slope variant | `tri_mask[]` 0–80 → 0–7 | `heightVariant()` (up-triangle table) |
-| Triangle shape | binary mask stencil | true-triangle geometry (equivalent — see §7.1); mask decoder available |
-| Texture sampling | 1:1 tiled, wraparound | axis-aligned 1:1 UV per triangle |
+| Ground sprites | `tri_spr[]`, PAK 260–292 (8 slope variants) | `terrainSpriteId()` → **one flat variant** (PAK base+4) per terrain |
+| Slope variation | per-tile slope-variant sprite (`tri_mask[]`) | **per-vertex directional shading** (`shadeAt`), not slope sprites |
+| Triangle shape | binary mask stencil | true-triangle geometry (equivalent — see §7.1) |
+| Texture sampling | 1:1 tiled, wraparound | screen-space tiled UV (`fract(x/32, y/20)`) |
+| Transitions | dithered masks + overlap | **procedural** screen-space dither on expanded boundary triangles |
 
 ### Architecture A (ours) vs B (original) — and why they're equivalent
 
@@ -196,29 +197,18 @@ axis-aligned rectangles on the CPU and needs a stencil to carve out the
 triangle and its slope*. On the GPU we draw real triangles whose shared vertices
 carry per-position heights, so the slope and gap-free tessellation come for free.
 
-### 7.2 Implemented: masked-terrain shader (port of `MaskedTriangleShader`)
+### 7.2 (removed) masked-terrain shader experiments
 
-The terrain now renders through a faithful port of the C# masked-triangle pipeline
-while keeping the gap-free per-vertex-height geometry (a deliberate hybrid that
-takes the best of both architectures):
-
-- **Mask decoder** — `bmp.zig: decodeMask` decodes the RLE `(drop, fill)` mask
-  format into a white/transparent 1-bit stencil.
-- **Mask loading** — `texture_atlas.zig: loadMaskRange` packs `AssetMapMaskUp`
-  (PAK 60-140) and `AssetMapMaskDown` (PAK 141-221) into the atlas with edge
-  padding; `AtlasEntry` now also stores the sprite hotspot offset.
-- **Shader** — `Shader.createMaskedTerrain` mirrors the C# GLSL:
-  ```glsl
-  vec2 g  = fract(v_ground_local);                       // tile the 32x20 ground
-  vec4 px = texture2D(tex, v_ground_region.xy + g*v_ground_region.zw);
-  vec4 mk = texture2D(tex, v_mask_uv);                   // binary stencil
-  if (px.a * mk.a < 0.5) discard;                        // carve the triangle
-  gl_FragColor = vec4(px.rgb, 1.0);
-  ```
-- **Geometry** — each tile emits its two triangles (6 verts). The DOWN triangle
-  uses the down mask (flat slope idx 40 = PAK 181), the UP triangle the up mask
-  (PAK 100). Ground is sampled with `fract` (native-res, phase-aligned, tiling),
-  not stretched.
+An earlier iteration ported the C# masked-triangle pipeline literally: a mask
+decoder (`bmp.zig: decodeMask`), mask atlas loading (`texture_atlas.zig:
+loadMaskRange` for `AssetMapMaskUp` PAK 60-140 / `AssetMapMaskDown` PAK 141-221),
+and a fragment `discard` on the binary mask stencil. This was abandoned once the
+masks turned out to be **dithered** (§7.3) and impossible to tessellate cleanly on a
+zoomed GPU framebuffer. **All of this mask infrastructure has since been deleted**
+(`decodeMask`, `loadMaskRange`, `TRI_MASK_UP/DOWN`, `maskIndex`, `heightVariant`,
+`variantFor`, the `MaskRegion`/`emitQuad` quad path); the shipped renderer uses the
+procedural transition in §7.6 instead. The notes below (§7.3–§7.5) are kept as the
+**research record** that led to that decision, not as a description of current code.
 
 ### 7.3 Key finding: the masks are DITHERED, and need architecture B
 
@@ -238,8 +228,8 @@ geometry punches the dither holes straight through to the framebuffer clear colo
 cleanly and gap-free, so the dithered stencil is not only redundant but harmful
 here. The shader now samples the ground 1:1 over the triangle (clamped, no `fract`
 wrap → no edge seam) and discards only on the ground's own alpha. Result:
-pixel-exact NEAREST terrain, gap-free relief, no blue artifact. The mask decoder,
-loader, and atlas entries remain in place.
+pixel-exact NEAREST terrain, gap-free relief, no blue artifact. (The mask decoder
+and loader that this paragraph referred to were later removed — see §7.2.)
 
 **To actually use the dithered masks** (faithful dithered transitions) one must
 switch terrain to **architecture B**: render each triangle as an overlapping
@@ -285,25 +275,28 @@ from:
 
 That stipple where two different-terrain triangles meet *is* the transition effect.
 
-### 7.6 Final approach: clean base + procedural dithered transition
+### 7.6 SHIPPED approach: clean base + procedural dithered transition
 
-The PAK dithered masks (32×25, overlapping) could not be made to tessellate
-cleanly on a zoomed GPU framebuffer — they left either background-bleed holes or a
-messy scattered transition band. Replaced with a controllable procedural dither:
+This is the **current, shipped** terrain path (`map_renderer.zig` +
+`Shader.createMaskedTerrain`). The PAK dithered masks (32×25, overlapping) could not
+be made to tessellate cleanly on a zoomed GPU framebuffer — they left either
+background-bleed holes or a messy scattered transition band. They were replaced with
+a controllable procedural dither rendered in **two passes** that share one shader via
+the `u_use_mask` uniform:
 
 - **Base pass** (`u_use_mask=0`, all tiles) — each tile is a clean, gap-free
   **parallelogram** (4 verts P,R,Dn,DR; UP=P,Dn,DR / DOWN=P,R,DR) with per-vertex
   height relief and the flat uniform ground sprite. No overlap → crisp diagonal
   terrain boundaries, smooth interiors, water = blue fallback.
-- **Overlay pass** (`u_use_mask=1`, **boundary tiles only**) — each boundary tile's
-  two triangles are **expanded ~1.45× from their centroid** so they bleed into the
-  neighbour, tagged with barycentric coords. The shader computes an edge-fade
-  (`coverage = min(bary)/0.16`, 1 in the core → 0 at the rim) and an **ordered
-  dither** (interleaved gradient noise on `gl_FragCoord`); fragments are discarded
-  where `coverage < dither`, revealing the base (neighbour) behind. Both terrains'
-  expanded triangles interleave → a clean stippled transition, fully under our
-  control (no PAK masks). The `MapRenderer` now keeps separate base and overlay
-  VBO/IBO pairs.
+- **Overlay pass** (`u_use_mask=1`, **boundary tiles only**, `isTerrainBoundary`) —
+  each boundary tile's two triangles are **expanded `EXPAND = 1.7×` from their
+  centroid** (`emitTri`) so they bleed into the neighbour, tagged with barycentric
+  coords. The shader computes an edge-fade (`coverage = smoothstep(0.0, 0.30, e)`
+  where `e = min(bary)`, ~0 at the rim → 1 toward the core) and an **ordered dither**
+  (interleaved gradient noise on `gl_FragCoord`); fragments are discarded where
+  `coverage < dither`, revealing the base (neighbour) behind. Both terrains' expanded
+  triangles interleave → a clean stippled transition, fully under our control (no PAK
+  masks). The `MapRenderer` keeps separate base and overlay VBO/IBO pairs.
 
   **Smoothness tuning.** The C# `MaskedTriangleShader` is confirmed to be a *hard*
   `discard` on the mask (no anti-aliasing) — its smooth-looking transitions come
@@ -312,6 +305,41 @@ messy scattered transition band. Replaced with a controllable procedural dither:
   wide bleed (`EXPAND = 1.7`) and a `smoothstep(0, 0.30, e)` density ramp on the
   edge-fade, so the ordered dither dissolves gradually instead of as a thin band.
   Two dials: `EXPAND` (band width) and the smoothstep upper bound (density falloff).
+
+  **Per-vertex overlay tints.** `emitTri` takes a tint for *each* of its three
+  vertices (cP/cDn/cDR for the UP triangle, cP/cR/cDR for DOWN) rather than one flat
+  per-triangle colour. An earlier version flat-shaded the whole overlay triangle at a
+  single corner's brightness, which produced visible **triangular shadow facets**
+  along transitions (screenshot 23). Passing all three corner tints makes the overlay
+  Gouraud-shade exactly like the base, so the dither dissolves invisibly.
+
+### 7.7 Terrain relief shading (per-vertex directional light)
+
+The reference shows grass brightness varying with height/slope. **Neither C++
+freeserf nor C# freeserf.net applies runtime lighting** — they bake the effect into
+8 pre-shaded slope-variant sprites per terrain (PAK 260–291), selected by the
+slope-mask index. We deliberately force the single **flat variant** (`FLAT_VARIANT
+= 4`, so `terrainSpriteId` returns `base + 4`) because driving the ground sprite by
+per-tile slope made snow/tundra interiors grainy (neighbours at the renormalised
+height extremes picked different sprites). Relief is therefore reintroduced as
+**procedural per-vertex shading** instead of slope sprites:
+
+- `shadeAt(map, x, y)` computes a brightness multiplier from the local height
+  gradient dotted with a fixed light direction (upper-left):
+  `dhx = h(x+1,y) - h(x-1,y)`, `dhy = h(x,y+1) - h(x,y-1)`,
+  `s = clamp(AMBIENT + DIFFUSE·(−dhx − dhy), MIN, MAX)`.
+  Constants: `SHADE_AMBIENT 0.92`, `SHADE_DIFFUSE 0.13`, `SHADE_LX/LY 1.0`,
+  `SHADE_MIN 0.6`, `SHADE_MAX 1.25`. Flat ground → ~`AMBIENT`; light-facing slopes
+  brighten, away-facing darken.
+- `cornerTint(fallback, ca, s)` turns that brightness into the vertex `a_color`:
+  textured tiles (`ca=1`) → grey `(s,s,s)`; water (`ca=0`, no sprite) → `fallback*s`.
+- The shader applies it as `mix(v_color.rgb, px.rgb * v_color.rgb, v_color.a)`:
+  textured → `px * (s,s,s)` (shaded sprite), water → the blue fallback scaled by `s`.
+- Because `shadeAt` reads shared grid heights, the four corners of adjacent tiles
+  agree → smooth, seamless **Gouraud** shading with no per-tile facets.
+
+This was chosen over a "faithful" slope-variant-sprite mode after comparing both on
+screen; the faithful mode and its runtime toggle were then removed.
 
 ### 7.5 (superseded) architecture B + waves overlay
 
@@ -390,7 +418,10 @@ The terrain path is now full architecture B:
 | 15 | axis-aligned 1:1 UV | seams gone; flat (no relief) |
 | 16 | + 2.5D relief + bilinear terrain | rolling hills; bilinear softens (non-original) |
 | 17 | masked shader, NEAREST (geometry-clipped) | clean but water lost (color fallback dropped) |
-| (current) | **architecture B** + waves overlay | overlapping dithered masked quads, back-to-front, animated water |
+| 18–21 | architecture B (dithered masked quads) + waves | overlap → blue speckle / grainy interiors; PAK masks couldn't tessellate cleanly when zoomed |
+| 22 | procedural dither (base + expanded boundary overlay) | transitions controllable, but flat-shaded overlay left triangular shadow facets |
+| 23 | + per-vertex height shading + per-vertex overlay tints | facets gone; smooth shaded relief — **shipped** |
+| (current) | base+overlay procedural dither, per-vertex directional shading, animated interior waves, building shadows | mask/faithful code removed (§7.2); see §7.6–§7.7 and §10 |
 
 ---
 

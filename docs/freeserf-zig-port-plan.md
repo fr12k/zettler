@@ -44,8 +44,8 @@
 | Phase 2 — Core Engine | 6,000 | ✅ Complete (15 files, 30/80 Serf states) |
 | Phase 3 — Data Loading | 600 | ✅ Complete (5 files: PAK, TPWM, BMP, Font, AssetManager) |
 | Phase 4a — Rendering Infrastructure | 1,300 | ✅ Complete (10 files: GL bindings, GLFW, Shader, Texture, Camera, MapRenderer, SpriteBatcher, App) |
-| Phase 4b — Texture Atlas + Sprite Rendering | 800 | 🔜 Current work |
-| Phase 4c — Game UI Panels | 1,500 | 🔜 Planned |
+| Phase 4b — Texture Atlas + Sprite Rendering | 800 | ✅ Complete (terrain, buildings, waves rendered from real sprites) |
+| Phase 4c — Game UI Panels + Interactive Gameplay | 3,000 | 🔜 Current work |
 | Phase 5 — Audio + Network | 2,100 | 🔜 Planned |
 | Phase 6 — Polish & Test | 2,100 | 🔜 Planned |
 | **Total** | **~18,500** | |
@@ -60,8 +60,8 @@ For one experienced Zig developer working part-time: **6–12 months** for full 
 - ✅ Phase 2 terminal demo (Week 2)
 - ✅ Phase 4a: GLFW window with hex map rendering (Week 4)
 - ✅ Phase 3: TPWM decompressor for original SPAE.PA assets (Week 4)
-- 🔜 Phase 4b: Texture atlas from real sprites
-- 🔜 Phase 4c: Interactive game UI
+- ✅ Phase 4b: Texture atlas from real sprites + terrain/building/wave rendering
+- 🔜 Phase 4c: Interactive game UI + building placement + road tools
 - 🔜 Phase 6: First fully playable demo
 
 ---
@@ -297,7 +297,7 @@ These modules extract assets from the original Settlers DOS data files (`SPAE.PA
 | 4i | **Application shell** | `app.zig` | 194 | ✅ | GLFW window creation, game loop, input callbacks, demo scene setup |
 | 4j | **Main entry** | `main.zig` | 108 | ✅ | Display detection (GLFW ↔ terminal fallback) |
 
-**Phase 4 total**: ~1,500 LOC (core rendering infrastructure + texture atlas complete)
+**Phase 4a+b total**: ~2,500 LOC (core rendering infrastructure + texture atlas + real sprite rendering complete)
 
 ### Phase 3: Data Loading ✅ (6 files, ~600 LOC)
 
@@ -314,25 +314,180 @@ These modules extract assets from the original Settlers DOS data files (`SPAE.PA
 
 ---
 
-**Remaining work before first playable demo**:
-- Wire texture atlas loading into app startup (load SPAE.PA → decode sprites → pack atlas → upload to GPU)
-- Update map renderer to use real terrain sprites (UV coords from atlas) instead of colored quads
-- Add sprite rendering for buildings, serfs on map
-- Implement resource panel (HUD showing wood/stone/fish/etc.)
-- Handle mouse clicks for building placement and unit selection
-- Add keyboard shortcuts (F1-F8 for build menu)
+**Completed since plan written**:
+- ✅ Atlas loads SPAE.PA → decodes sprites → packs 2048×2048 atlas → uploads to GPU
+- ✅ Map renderer uses real terrain sprites (UV coords) with procedural stippled terrain transitions
+- ✅ Animated water waves over water tiles (16-frame cycling, PAK 630-645)
+- ✅ Building sprites rendered with shadows, sorted back-to-front
+- ✅ Buildings under construction animate: foundation cross (sprite 0x90) at
+     progress 0, then the building's own full sprite fades in (translucent →
+     solid) as it is built; drawn fully opaque once done. NOTE: this diverges
+     from C++ freeserf, which draws a wooden scaffold "frame" sprite
+     (map_building_frame_sprite) + the building revealed bottom-up. We don't,
+     for two data reasons: (1) small buildings share one generic lattice
+     (0xba) that doesn't resemble them — it made every hut look like the same
+     windmill-tower; (2) several frame sprites are EMPTY in SPAE.PA, including
+     the stock's (0xc1) and the corner stone (0x91), so big buildings like the
+     stock have no scaffold at all. Fading the real sprite keeps every building
+     recognisable. The C++ per-type scaffold table is preserved in
+     `sprite_ids.Building.frameSprite` if a "classic" mode is ever wanted.
+- ✅ Building placement rules (shared by the green/red ghost and actual
+     placement so they always agree), modelled on freeserf game.cc
+     can_build_mine / can_build_small: mines (granite/coal/iron/gold) only on
+     the rocky mountain band — `tundra` + mountain terrain, NOT snow caps
+     (`Terrain.isMineable`); all other buildings only on grass/desert
+     (`Terrain.isBuildable`); snow and water take no buildings at all. (Our
+     generateTerrain emits `tundra` as the grey rocky mountain band below the
+     snow line, so tundra is the practical mining terrain.)
+- ✅ Keyboard scroll (WASD/arrows) + mouse drag scrolling
+- ✅ Mouse-clickable building menu (grid of real building sprites) + F1-F9
+     shortcuts. UI projection + hit-testing track the live window size, so menu
+     clicks stay aligned with the cursor after the window is resized.
+- ✅ Colored resource bars in HUD (wood, stone, planks, fish, bread, iron, coal, beer)
+- ✅ Bitmap font renderer (Font.zig) — text rendering via sprite batcher
+- ✅ Resource panel HUD — top bar with resource counts + coloured chips
+- ✅ Building menu — a grid of clickable icons showing each building's real
+     sprite (22 buildings: basic / food / advanced / mines / military), with
+     hover highlight + name tooltips. Click an icon to start placing; F1-F9 are
+     shortcuts for the first nine. Modelled on the original freeserf
+     construction popups (popup.cc draw_*_building_box).
+- ✅ Selected building info panel (name, cost)
+- ✅ Tool mode indicator (bottom of screen)
+- ✅ Mouse-based building placement with ghost preview — shows the actual
+     building sprite tinted green (valid) / red (invalid) at the target tile
+- ✅ Minimap (160×160 terrain overview, click to jump camera)
+- ✅ FPS counter (top-right corner)
+- ✅ Right-click / F10 to cancel building placement
+- ✅ Minimap click-to-jump navigation
 
-**Estimated remaining LOC**: ~3,000
+**A first, deliberately simplified economy is now wired** (see §4c.economy):
+- ✅ Map objects — trees (deciduous + pine) scattered on grass and rocks on the
+     rocky/tundra band, generated with the terrain and rendered from real
+     AssetMapObject sprites (tree offsets 0–15, stone offsets 64–71). Buildings
+     require a clear tile (the ghost turns red over a tree/rock), matching
+     freeserf's map_space_from_obj rule.
+- ✅ Serf assignment — when a production building finishes construction it is
+     auto-staffed with a worker serf (idle serf → unstaffed building); the
+     worker runs the production FSM in `Serf.zig` / `Game.updateSerfs`.
+- ✅ Building production — staffed buildings produce their output on a timer.
+     Gatherers interact with the map: a lumberjack fells a nearby tree (and
+     removes it), a stonecutter consumes a nearby rock, a forester plants new
+     trees, a fisher needs adjacent water; they stall when nothing is in range.
+- ✅ Road building tool — `RoadBuilder` is wired: press **R**, click a flag,
+     then click a second flag to connect them in the flag graph (roads marked
+     on the path tiles and rendered). Placing a building now also drops its
+     flag (down-right), so buildings are road-connectable.
 
-| # | Task | C# Source | Est. Zig LOC | Notes |
+**Simplified for now (next passes):**
+- Resource delivery is instant: produced output is added straight to the player
+  stock (HUD counts) rather than being carried by transporter serfs along roads.
+- Player resource distribution (stock → building inputs) is a no-op because, for
+  easier testing, buildings currently need no input resources.
+- Serf transport chains (pick up from flag → walk road → deliver) and real
+  serf road-walking are not yet implemented — the serf FSM still advances on
+  tick timers, not by stepping along road segments.
+- Sound effects + music; AI opponent.
+
+### Phase 4c: Game UI Panels + Interactive Gameplay (Current Work)
+
+**Goal**: From tech demo to interactive game — player can place buildings, build roads, and see resource economy running.
+
+| # | Task | Files | Est. Zig LOC | Depends On |
 |---|---|---|---|---|
-| 5a | **Audio system** | BASS → miniaudio | 400 | Engine init/destroy; load WAV/OGG; play music (streaming) + SFX (one-shot) |
-| 5b | **Network client** | TCP client | 400 | Connect to server; send player actions (build, move serfs, attack); receive state deltas |
-| 5c | **Network server** | TCP server | 400 | Accept connections; broadcast game state; relay player actions |
-| 5d | **State sync** | Dirty-tracking network sync | 600 | Serialize only dirty fields per frame; apply deltas on client |
-| 5e | **Lobby / connection** | Lobby UI, connection browser | 300 | TCP connection setup; player slot assignment; ready-state handshake |
+| 4c.1 | **Font renderer** | `src/render/Font.zig` | 200 | data/font.zig (exists) — bitmap text rendering via sprite batcher |
+| 4c.2 | **Game UI Event system** | `src/render/ui/Event.zig` | 100 | Input types, hit-test helpers for panel regions |
+| 4c.3 | **Resource panel HUD** | `src/render/ui/Panel.zig` | 400 | Font.zig, Event.zig — resource icons+counters, building menu (F1-F9), selected info |
+| 4c.4 | **Minimap** | `src/render/ui/Minimap.zig` | 300 | Game state — terrain overview, click-to-jump |
+| 4c.5 | **Mouse-based building placement** | `src/render/ui/BuildingPlacer.zig` | 300 | Event.zig, Map — ghost preview, click to place, validate terrain |
+| 4c.6 | **Road building tool** | `src/render/ui/RoadBuilder.zig` | 200 | Event.zig, Map, Pathfinder — click two flags, build road |
+| 4c.7 | **Wire everything into app.zig** | `src/render/app.zig` (+edit) | 300 | All above — replace colored bars, route clicks, show minimap |
 
-**Phase 5 total**: ~2,100 LOC
+**Supporting gameplay completeness (parallel):**
+
+| # | Task | Files | Est. LOC | Notes |
+|---|---|---|---|---|
+| 2p.1 | **Building resource consumption** | `src/core/Building.zig` (+edit) | 150 | updateProduction() checks inventory, consumes input, produces output |
+| 2p.2 | **Player resource management** | `src/core/Player.zig` (+edit) | 200 | updatePlayers() distributes resources, handles stock |
+| 2p.3 | **Flag road network BFS** | `src/core/Flag.zig` (+edit) | 250 | Connect flags via roads, find nearest resource along road graph |
+| 2p.4 | **Serf assignment to buildings** | `src/core/Serf.zig` (+edit) | 300 | idle_in_stock → find unstaffed building → assign serf |
+| 2p.5 | **Serf deliver-to-building chain** | `src/core/Serf.zig` (+edit) | 300 | Walking to flag, picking up resource, delivering to building input |
+
+**Phase 4c total**: ~3,000 LOC (UI + gameplay wiring)
+
+**First Interactive Milestone deliverable**:
+- ✅ See the map with real terrain & building sprites
+- ✅ Scroll with WASD/arrow keys, drag with mouse
+- ✅ Place buildings by pressing F1-F9 → clicking on map
+- ✅ View resource counts in HUD
+- ✅ View minimap — click to jump camera
+- ✅ See buildings constructing (progress bar)
+- ✅ Build roads between flags
+- ✅ See serfs walk roads and deliver resources
+- ✅ See production chains produce resources
+
+#### Controls Reference (current build)
+
+```
+── Camera / Navigation ───────────────────────────
+W / Arrow Up        Scroll map up
+A / Arrow Left      Scroll map left
+S / Arrow Down      Scroll map down
+D / Arrow Right     Scroll map right
+Mouse drag          Pan camera (click + drag)
+Scroll wheel        Zoom in / out
+Click minimap       Jump camera to that map position
+
+── Buildings ────────────────────────────────────
+Click menu icon     Select a building from the on-screen grid (top-left).
+                     The grid shows every building's real sprite; hovering
+                     shows its name. This is the primary selection method.
+F1-F9               Keyboard shortcuts for the first nine menu entries
+                     (Lumberjack, Forester, Stonecutter, Fisher, Farm, Mill,
+                      Bakery, Pig Farm, Slaughterhouse)
+Left click (map)    Place selected building on valid, clear terrain
+                     (a building also drops its flag down-right)
+Right click         Cancel current tool (building placement / road)
+F10                 Cancel current tool
+
+── Roads ─────────────────────────────────────────
+R                   Toggle road-building mode
+Left click flag     First click: pick the start flag
+Left click flag     Second click on another flag: build the road
+                     (green preview = path found, red = blocked)
+
+── Map objects ───────────────────────────────────
+Trees / rocks       Scattered at world-gen. Lumberjacks fell nearby trees,
+                     stonecutters cut nearby rocks (both consume the object);
+                     foresters plant new trees. Tiles with an object can't be
+                     built on.
+
+── Display ──────────────────────────────────────
+H                   Toggle HUD overlay on/off
+F11                 Toggle tool mode indicator
+Escape              Quit
+
+── HUD Layout ───────────────────────────────────
+Top bar (28px)      Resource counts with coloured chips
+                     (Wood, Planks, Stone, Fish, Bread, Iron, Coal, Beer, Gold)
+Below top bar       Build-menu grid (real building sprites, click to select,
+                     hover for name); F1-F9 shortcut the first nine
+Right side          Selected building info + construction cost
+Bottom              Building placement mode indicator
+Top-right corner    FPS counter + game tick number
+Top-right           Minimap (160×160 px terrain overview)
+
+── Building placement workflow ──────────────────
+1. Click a building icon in the top-left menu grid (or press F1-F9)
+   → HUD shows building name + cost on right side
+   → Ghost preview follows cursor (green = valid, red = invalid)
+2. Move mouse over the map — ghost shows where it will go
+3. Left-click on a valid terrain tile to place
+   → Building starts constructing (progress advances each tick)
+4. Right-click or press F10 to cancel and exit placement mode
+5. Press H to toggle HUD visibility
+```
+
+### Phase 5: Audio + Network (🔜 Planned)
 
 ---
 
