@@ -640,6 +640,7 @@ pub const App = struct {
     }
 
     /// Convert the current mouse position to the map tile under the cursor.
+    /// Uses wrapping so tiles across the map edge are correctly identified.
     fn mouseToTile(self: *App) core.MapPos {
         const world = self.camera.screenToWorld(@floatCast(self.mouse_x), @floatCast(self.mouse_y));
         const tw: f32 = map_renderer_mod.TileWidth;
@@ -647,14 +648,10 @@ pub const App = struct {
         const hw: f32 = tw / 2.0;
         const row_f = world.y / th;
         const col_f = (world.x + row_f * hw) / tw;
-        var col: i32 = @intFromFloat(@round(col_f));
-        var row: i32 = @intFromFloat(@round(row_f));
+        const col: i32 = @intFromFloat(@round(col_f));
+        const row: i32 = @intFromFloat(@round(row_f));
         const map = &self.game.state.map;
-        if (col < 0) col = 0;
-        if (row < 0) row = 0;
-        if (col >= map.width) col = map.width - 1;
-        if (row >= map.height) row = map.height - 1;
-        return .{ .x = @intCast(col), .y = @intCast(row) };
+        return .{ .x = map.wrapX(col), .y = map.wrapY(row) };
     }
 
     /// Draw roads (segments between connected road/flag tiles), flag posts, and
@@ -666,6 +663,7 @@ pub const App = struct {
 
         // Road segments: for each road/flag tile, connect to forward neighbours
         // that are also road/flag (forward dirs only, to avoid drawing twice).
+        // Uses WRAPPING so roads draw correctly across map edges.
         const fwd = [_]core.Direction{ .right, .down_right, .down };
         for (0..map.height) |yy| {
             for (0..map.width) |xx| {
@@ -674,8 +672,7 @@ pub const App = struct {
                 if (!(t.has_road or t.has_flag)) continue;
                 const c0 = self.tileCenter(pos);
                 for (fwd) |d| {
-                    const np = map.getNeighbor(pos, d);
-                    if (!map.isValidPos(np)) continue;
+                    const np = map.getNeighborWrapped(pos, d);
                     const nt = map.getTile(np);
                     if (!(nt.has_road or nt.has_flag)) continue;
                     const c1 = self.tileCenter(np);
@@ -800,9 +797,8 @@ pub const App = struct {
         // whose whole footprint is also water, otherwise the sprite "floods" the
         // adjacent grass. Shoreline water stays static (no spill).
         const isWater = struct {
-            fn at(m: *core.map.Map, x: usize, y: usize) bool {
-                if (x >= m.width or y >= m.height) return false;
-                return m.getTileXY(@intCast(x), @intCast(y)).terrain == .water;
+            fn at(m: *core.map.Map, x: i32, y: i32) bool {
+                return m.getTileWrapped(x, y).terrain == .water;
             }
         }.at;
 
@@ -813,8 +809,11 @@ pub const App = struct {
                 const tile = map.getTileXY(@intCast(xx), @intCast(yy));
                 if (tile.terrain != .water) continue;
                 // Skip shoreline tiles to avoid waves spilling onto land.
-                if (!isWater(map, xx + 1, yy) or !isWater(map, xx, yy + 1) or
-                    !isWater(map, xx + 1, yy + 1)) continue;
+                // Uses wrapping so edge water checks neighbours across the seam.
+                const xxi: i32 = @intCast(xx);
+                const yyi: i32 = @intCast(yy);
+                if (!isWater(map, xxi + 1, yyi) or !isWater(map, xxi, yyi + 1) or
+                    !isWater(map, xxi + 1, yyi + 1)) continue;
                 const pos: u64 = @as(u64, yy) * map.width + xx;
                 const frame: u16 = @intCast(((pos ^ 5) + (tick >> 3)) & 0xf);
                 const entry = self.atlas.get(630 + frame) orelse continue;
