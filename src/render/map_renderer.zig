@@ -149,7 +149,7 @@ fn mkVert(x: f32, y: f32, gu: f32, gv: f32, eu: f32, ev: f32, euw: f32, evh: f32
 /// from its centroid by `expand` (so it bleeds into neighbours) and tagged with
 /// barycentric coords A=(1,0) B=(0,1) C=(0,0) for the shader's edge-fade dither.
 /// Ground UV is screen-space so the overlay tiles like the base.
-fn emitTri(verts: []MapRenderer.Vertex, idx: []u16, base: u16,
+fn emitTri(verts: []MapRenderer.Vertex, idx: []u32, base: u32,
     ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, expand: f32,
     eu: f32, ev: f32, euw: f32, evh: f32,
     c0: [3]f32, c1: [3]f32, c2: [3]f32, a: f32) void {
@@ -269,11 +269,11 @@ pub const MapRenderer = struct {
         // the base (neighbour) behind → a clean procedural stippled transition.
         const base_v = try allocator.alloc(Vertex, num_tiles * 4);
         defer allocator.free(base_v);
-        const base_i = try allocator.alloc(u16, num_tiles * 6);
+        const base_i = try allocator.alloc(u32, num_tiles * 6);
         defer allocator.free(base_i);
         const ov_v = try allocator.alloc(Vertex, num_tiles * 6);
         defer allocator.free(ov_v);
-        const ov_i = try allocator.alloc(u16, num_tiles * 6);
+        const ov_i = try allocator.alloc(u32, num_tiles * 6);
         defer allocator.free(ov_i);
         var ov_vc: usize = 0; // overlay vertex count
         var ov_ic: usize = 0; // overlay index count
@@ -419,7 +419,7 @@ pub const MapRenderer = struct {
         gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ibo);
         for (offsets) |off| {
             self.shader.setOffset(off[0], off[1]);
-            gl.drawElements(gl.GL_TRIANGLES, @intCast(self.index_count), gl.GL_UNSIGNED_SHORT, 0);
+            gl.drawElements(gl.GL_TRIANGLES, @intCast(self.index_count), gl.GL_UNSIGNED_INT, 0);
         }
 
         // Pass 2: Overlay (boundary tiles only) at all 9 offsets.
@@ -430,7 +430,7 @@ pub const MapRenderer = struct {
             gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.overlay_ibo);
             for (offsets) |off| {
                 self.shader.setOffset(off[0], off[1]);
-                gl.drawElements(gl.GL_TRIANGLES, @intCast(self.overlay_index_count), gl.GL_UNSIGNED_SHORT, 0);
+                gl.drawElements(gl.GL_TRIANGLES, @intCast(self.overlay_index_count), gl.GL_UNSIGNED_INT, 0);
             }
         }
 

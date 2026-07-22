@@ -182,13 +182,24 @@ pub const App = struct {
     view_w: f32 = @floatFromInt(WINDOW_WIDTH),
     view_h: f32 = @floatFromInt(WINDOW_HEIGHT),
 
-    pub fn init(allocator: std.mem.Allocator) !App {
-        var game_state = try Game.init(allocator, 64, 64, 1);
+    pub fn init(allocator: std.mem.Allocator, map_w: u16, map_h: u16) !App {
+        var game_state = try Game.init(allocator, map_w, map_h, 1);
         errdefer game_state.deinit();
 
         var camera = Camera{};
         camera.setViewportSize(WINDOW_WIDTH, WINDOW_HEIGHT);
-        camera.centerOn(32.0 * 32.0, 32.0 * 10.0); // map center: TileWidth=32
+        // Center on the middle of the actual map. The isometric projection is
+        //   screen_x = col * TileWidth - row * (TileWidth/2)
+        //   screen_y = row * TileHeight
+        // so the map center in screen space is:
+        //   cx = (map_w/2) * TileWidth - (map_h/2) * (TileWidth/2)
+        //   cy = (map_h/2) * TileHeight
+        const half_w: f32 = @as(f32, @floatFromInt(map_w)) * 0.5;
+        const half_h: f32 = @as(f32, @floatFromInt(map_h)) * 0.5;
+        camera.centerOn(
+            half_w * map_renderer_mod.TileWidth - half_h * (map_renderer_mod.TileWidth * 0.5),
+            half_h * map_renderer_mod.TileHeight,
+        );
         camera.zoom = 2.0;
 
         return .{
