@@ -199,5 +199,11 @@ pub const SpriteBatcher = struct {
         gl.disableVertexAttribArray(1);
         gl.disableVertexAttribArray(2);
         self.sprite_count = 0;
+        // Clear auto-flush state so a stale pointer can never be dereferenced
+        // by a later add() outside the render pass that registered it.
+        self.flush_fn = null;
+        self.flush_shader = null;
+        self.flush_texture = null;
+        self.flush_camera = null;
     }
 };

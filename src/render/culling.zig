@@ -48,7 +48,9 @@ pub const TileIter = struct {
     /// Optional visited bitmap (sized ceil(map_w*map_h/8) bytes) to suppress
     /// duplicate tiles when the view spans more than one period.
     visited: []u8 = &.{},
-    visited_len: usize = 0,
+    /// Number of tiles the bitmap can hold (map_w * map_h), NOT the byte
+    /// length of the `visited` slice.
+    visited_bits: usize = 0,
 
     pub fn next(self: *TileIter) ?MapPos {
         while (self.row <= self.row_hi) {
@@ -56,12 +58,15 @@ pub const TileIter = struct {
                 const c = self.col;
                 const r = self.row;
                 self.col += 1;
+                if (self.map_w == 0 or self.map_h == 0) return null;
                 const w: i32 = @mod(c, self.map_w);
                 const h: i32 = @mod(r, self.map_h);
                 const lin: usize = @intCast(h * self.map_w + w);
-                if (self.visited_len > 0) {
-                    if (lin < self.visited_len and self.visited[lin >> 3] & (@as(u8, 1) << @intCast(lin & 7)) != 0) continue;
-                    if (lin < self.visited_len) self.visited[lin >> 3] |= (@as(u8, 1) << @intCast(lin & 7));
+                if (self.visited_bits > 0 and lin < self.visited_bits) {
+                    const byte_idx = lin >> 3;
+                    const bit_mask: u8 = @as(u8, 1) << @intCast(lin & 7);
+                    if (self.visited[byte_idx] & bit_mask != 0) continue;
+                    self.visited[byte_idx] |= bit_mask;
                 }
                 return .{ .x = @intCast(w), .y = @intCast(h) };
             }
@@ -103,24 +108,33 @@ pub fn visibleTiles(
 
     // Clamp the iteration to at most one full period in each axis so we never
     // visit more tiles than the map contains.
+    // Clamp the iteration to at most one full period in each axis so we never
+    // visit more tiles than the map contains. When the span covers the whole
+    // map, reset the range to [0, map_size-1] so all residues are visited
+    // (important when row_lo/col_lo is negative).
     const r_span = row_hi - row_lo + 1;
     const c_span = col_hi - col_lo + 1;
-    const clamped_row_hi = if (r_span >= map_h) row_lo + map_h - 1 else row_hi;
-    const clamped_col_hi = if (c_span >= map_w) col_lo + map_w - 1 else col_hi;
+    const clamped_row_lo: i32 = if (r_span >= map_h) 0 else row_lo;
+    const clamped_row_hi: i32 = if (r_span >= map_h) map_h - 1 else row_hi;
+    const clamped_col_lo: i32 = if (c_span >= map_w) 0 else col_lo;
+    const clamped_col_hi: i32 = if (c_span >= map_w) map_w - 1 else col_hi;
 
     if (visited_buf.len > 0) @memset(visited_buf, 0);
+
+    // visited_bits = number of tiles the bitmap can address (map_w * map_h).
+    const visited_bits: usize = @as(usize, @intCast(map_w)) * @as(usize, @intCast(map_h));
 
     return .{
         .map_w = map_w,
         .map_h = map_h,
-        .row_lo = row_lo,
+        .row_lo = clamped_row_lo,
         .row_hi = clamped_row_hi,
-        .col_lo = col_lo,
+        .col_lo = clamped_col_lo,
         .col_hi = clamped_col_hi,
-        .row = row_lo,
-        .col = col_lo,
+        .row = clamped_row_lo,
+        .col = clamped_col_lo,
         .visited = visited_buf,
-        .visited_len = visited_buf.len,
+        .visited_bits = if (visited_buf.len > 0) visited_bits else 0,
     };
 }
 
@@ -153,5 +167,33 @@ test "visibleTiles no duplicates with visited buffer" {
     var it = visibleTiles(-10000, -10000, 10000, 10000, map, &buf);
     var count: usize = 0;
     while (it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 64 * 64), count);
+}
+
+test "visibleTiles no duplicates on a 512x512 map with visited buffer" {
+    // Regression: visited_len was set to the byte length of the buffer
+    // (131072) instead of the tile count (262144), so the bitmap only
+    // deduped the first half of the map.
+    var map = try Map.init(std.testing.allocator, 512, 512);
+    defer map.deinit();
+    const buf_bytes = (512 * 512 + 7) / 8;
+    const buf = try std.testing.allocator.alloc(u8, buf_bytes);
+    defer std.testing.allocator.free(buf);
+    var it = visibleTiles(-100000, -100000, 100000, 100000, map, buf);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 512 * 512), count);
+}
+
+test "visibleTiles handles negative row_lo with full-map span" {
+    // Regression: when the span covered the whole map and row_lo was
+    // negative, clamped_row_hi = row_lo + map_h - 1 missed residues.
+    var map = try Map.init(std.testing.allocator, 64, 64);
+    defer map.deinit();
+    var buf: [64 * 64 / 8 + 1]u8 = undefined;
+    var it = visibleTiles(-10000, -10000, 10000, 10000, map, &buf);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    // With the fix, all 64*64 tiles are visited exactly once.
     try std.testing.expectEqual(@as(usize, 64 * 64), count);
 }
