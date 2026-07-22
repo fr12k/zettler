@@ -307,18 +307,31 @@ pub const Map = struct {
         };
         defer self.allocator.free(field);
 
+        // Feature scale: how many tiles per Perlin grid cell. Larger values
+        // give larger landmasses; smaller values give finer detail. With
+        // scale=4, each Perlin grid cell spans 4 tiles, so the noise varies
+        // smoothly across the map rather than collapsing to 0 at every
+        // integer tile coordinate (Perlin noise is exactly 0 at integer
+        // grid points, so sampling at raw integer tile coords yields a flat
+        // field — this was the all-water bug).
+        const feature_scale: f64 = 4.0;
+        const px: f64 = @as(f64, @floatFromInt(w)) / feature_scale;
+        const py: f64 = @as(f64, @floatFromInt(h)) / feature_scale;
+
         for (0..self.height) |y| {
             for (0..self.width) |x| {
                 const fx: f64 = @floatFromInt(x);
                 const fy: f64 = @floatFromInt(y);
-                // Primary height noise (4 octaves for natural-looking terrain).
-                // Input is raw tile coordinates with period = map dimensions,
-                // so the noise tiles seamlessly at the map edges.
-                // Scale factor controls feature size: scale=1 means each noise
-                // cell covers one tile; scale=0.5 gives larger features.
+                // Sample the noise in a continuous domain: divide tile coords
+                // by feature_scale so adjacent tiles land on different parts
+                // of the Perlin field. The period is the map size divided by
+                // the same factor, so the noise still tiles seamlessly at the
+                // map edges (left↔right, top↔bottom).
+                const sx = fx / feature_scale;
+                const sy = fy / feature_scale;
                 const height_noise = noise_mod.fbm_perlin2d(
-                    fx, fy,
-                    perm, w, h, 4,
+                    sx, sy,
+                    perm, @intFromFloat(px), @intFromFloat(py), 4,
                 );
                 const idx = @as(usize, y) * @as(usize, self.width) + @as(usize, x);
                 field[idx] = height_noise;
