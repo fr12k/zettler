@@ -8,6 +8,7 @@ const core = @import("core");
 const render = @import("render");
 
 const App = render.App;
+const AppOptions = render.AppOptions;
 const Game = core.game.Game;
 const Resource = core.Resource;
 const Building = core.Building;
@@ -28,39 +29,70 @@ const data_paths = [_][]const u8{
     "SPAE.PA",
 };
 
-/// Parsed startup options.
-const Options = struct {
+/// Parsed command-line options. `help` short-circuits main and prints usage.
+///
+/// Map-size flags (`--map-size`, `--map-w`, `--map-h`) control the dimensions
+/// of a freshly generated map (clamped to [MapMinSize, MapMaxSize]). They are
+/// ignored when `map_file` is set — a loaded map keeps its stored dimensions.
+const CliOptions = struct {
     map_w: u16 = DEFAULT_MAP_W,
     map_h: u16 = DEFAULT_MAP_H,
+    seed: ?u64 = null,
+    map_file: ?[]const u8 = null,
+    save_map: ?[]const u8 = null,
+    help: bool = false,
 };
 
-/// Parse command-line arguments for map dimensions.
-/// Supported forms:
+/// Parse command-line arguments.
+///
+/// Map-size flags:
 ///   --map-size <W> <H>    e.g. --map-size 256 256
 ///   --map-size=WxH          e.g. --map-size=256x256  (also accepts 'X')
 ///   --map-w <W> --map-h <H>
 ///
-/// On malformed input a message is printed to stderr and the default
-/// (64×64) is kept. `parseArgs` itself never returns an error — the only
-/// fallible call (`Args.Iterator.initAllocator`) is handled inside.
-fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) Options {
-    var opts = Options{};
-    var args_it = std.process.Args.Iterator.initAllocator(args, allocator) catch {
-        std.debug.print("Failed to read command-line arguments; using defaults.\n", .{});
-        return opts;
+/// Seed / persistence flags:
+///   --seed <u64>         fix the procedural terrain seed
+///   --map-file <path>    load a .zmap file instead of generating a map
+///   --save-map <path>    write the generated/loaded map to this path
+///   --help, -h           show usage
+///
+/// On malformed map-size input a message is printed to stderr and the default
+/// (64×64) is kept. Missing values for --seed/--map-file/--save-map return
+/// `error.MissingValue`; invalid --seed returns `error.InvalidSeed`.
+fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !CliOptions {
+    var it = std.process.Args.Iterator.initAllocator(args, allocator) catch |err| {
+        // If initAllocator fails (e.g. OOM on WASI/Windows), there is nothing
+        // we can safely do — return defaults.
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{};
     };
-    defer args_it.deinit();
-    _ = args_it.next(); // skip program name
-    while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--map-size")) {
+    defer it.deinit();
+
+    var opts = CliOptions{};
+
+    // Skip argv[0] (program name).
+    _ = it.next();
+
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            opts.help = true;
+        } else if (std.mem.eql(u8, arg, "--seed")) {
+            const val = it.next() orelse return error.MissingValue;
+            opts.seed = std.fmt.parseInt(u64, val, 10) catch
+                std.fmt.parseInt(u64, val, 16) catch return error.InvalidSeed;
+        } else if (std.mem.eql(u8, arg, "--map-file")) {
+            opts.map_file = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--save-map")) {
+            opts.save_map = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--map-size")) {
             // Parse both values into temporaries and only commit to `opts`
             // when both succeed, so a bad height does not leave a lopsided
             // (w, default-h) map behind.
-            const w_str = args_it.next() orelse {
+            const w_str = it.next() orelse {
                 std.debug.print("--map-size requires <width> <height>\n", .{});
                 continue;
             };
-            const h_str = args_it.next() orelse {
+            const h_str = it.next() orelse {
                 std.debug.print("--map-size requires <width> <height>\n", .{});
                 continue;
             };
@@ -98,7 +130,7 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) Options {
                 std.debug.print("--map-size=WxH: missing 'x' separator in '{s}'\n", .{rest});
             }
         } else if (std.mem.eql(u8, arg, "--map-w")) {
-            const w_str = args_it.next() orelse {
+            const w_str = it.next() orelse {
                 std.debug.print("--map-w requires a width\n", .{});
                 continue;
             };
@@ -112,7 +144,7 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) Options {
                 std.debug.print("Invalid map width '{s}'\n", .{w_str});
             }
         } else if (std.mem.eql(u8, arg, "--map-h")) {
-            const h_str = args_it.next() orelse {
+            const h_str = it.next() orelse {
                 std.debug.print("--map-h requires a height\n", .{});
                 continue;
             };
@@ -125,16 +157,13 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) Options {
             } else |_| {
                 std.debug.print("Invalid map height '{s}'\n", .{h_str});
             }
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
-            std.process.exit(0);
-        } else {
-            std.debug.print("Unknown argument '{s}' (ignored)\n", .{arg});
         }
+        // Unknown args are ignored.
     }
 
-    // Clamp to the supported range and report when the requested size was
-    // adjusted.
+    // Clamp map size to the supported range and report when the requested
+    // size was adjusted. (Ignored when loading a .zmap — the file's stored
+    // dimensions take precedence.)
     const orig_w = opts.map_w;
     const orig_h = opts.map_h;
     opts.map_w = @max(MapMinSize, @min(MapMaxSize, opts.map_w));
@@ -160,13 +189,23 @@ fn printUsage() void {
         \\Usage: freeserf [options]
         \\
         \\Options:
-        \\  --map-size <W> <H>   Set the map size (e.g. --map-size 256 256)
-        \\  --map-size=WxH        Set the map size (e.g. --map-size=256x256)
-        \\  --map-w <W>           Set the map width
-        \\  --map-h <H>           Set the map height
-        \\  --help, -h            Show this help
+        \\  --map-size <W> <H>   Set the map size (e.g. --map-size 256 256).
+        \\  --map-size=WxH        Set the map size (e.g. --map-size=256x256).
+        \\  --map-w <W>           Set the map width.
+        \\  --map-h <H>           Set the map height.
+        \\  --seed <u64>          Fix the procedural terrain seed. Without this,
+        \\                       a random world is generated on every startup.
+        \\  --map-file <path>     Load a .zmap file (created with --save-map)
+        \\                       instead of generating a new map.
+        \\  --save-map <path>     Write the current map to this path so it can
+        \\                       be replayed later with --map-file.
+        \\  -h, --help            Show this help and exit.
         \\
         \\Map sizes from {d}x{d} to {d}x{d} are supported.
+        \\
+        \\Examples:
+        \\  freeserf --map-size 256 256 --seed 1234 --save-map world.zmap
+        \\  freeserf --map-file world.zmap
         \\
     , .{ MapMinSize, MapMinSize, MapMaxSize, MapMaxSize });
 }
@@ -178,20 +217,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const opts = parseArgs(init.args, allocator);
+    const opts = parseArgs(allocator, init.args) catch |err| {
+        std.debug.print("error parsing arguments: {}\n", .{err});
+        printUsage();
+        return;
+    };
+    if (opts.help) {
+        printUsage();
+        return;
+    }
     std.debug.print("Map size: {d}x{d}\n", .{ opts.map_w, opts.map_h });
 
     // Try GLFW first, fall back to terminal demo
-    const app_result = runGlfwDemo(allocator, opts.map_w, opts.map_h);
+    const app_result = runGlfwDemo(allocator, opts);
     if (app_result) |_| {} else |_| {
-        try runTerminalDemo(allocator, opts.map_w, opts.map_h);
+        try runTerminalDemo(allocator, opts);
     }
 }
 
-fn runGlfwDemo(allocator: std.mem.Allocator, map_w: u16, map_h: u16) !void {
+fn runGlfwDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
     std.debug.print("Initializing...\n", .{});
 
-    var app = try App.init(allocator, map_w, map_h);
+    var app = try App.init(allocator, opts.map_w, opts.map_h, .{
+        .seed = opts.seed,
+        .map_file = opts.map_file,
+        .save_map = opts.save_map,
+    });
     errdefer app.deinit();
 
     // Load game data (before OpenGL context — just file reading)
@@ -280,15 +331,28 @@ fn setupDemoScene(app: *App) !void {
     std.debug.print("  Scene: {} buildings\n", .{building_types.len});
 }
 
-fn runTerminalDemo(allocator: std.mem.Allocator, map_w: u16, map_h: u16) !void {
+fn runTerminalDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
     const out = std.debug.print;
     out("No display — terminal demo.\n", .{});
 
-    var game = try Game.init(allocator, map_w, map_h, 1);
+    var game = try Game.init(allocator, opts.map_w, opts.map_h, 1, .{
+        .seed = opts.seed,
+        .map_file = opts.map_file,
+    });
     defer game.deinit();
+    out("  Map seed: {}\n", .{game.map_seed});
 
-    const cx: u16 = map_w / 2;
-    const cy: u16 = map_h / 2;
+    // Optionally persist the map for later replay.
+    if (opts.save_map) |path| {
+        if (game.state.map.saveToFile(path, game.map_seed)) |_| {
+            out("  Map saved to {s}\n", .{path});
+        } else |err| {
+            out("  Warning: could not save map to '{s}': {}\n", .{ path, err });
+        }
+    }
+
+    const cx: u16 = opts.map_w / 2;
+    const cy: u16 = opts.map_h / 2;
     const positions = [_]MapPos{
         .{ .x = cx + 3, .y = cy }, .{ .x = cx, .y = cy + 3 },
         .{ .x = cx, .y = cy }, .{ .x = cx + 2, .y = cy + 2 },
