@@ -13,6 +13,7 @@ const camera_mod = @import("Camera.zig");
 const map_renderer_mod = @import("map_renderer.zig");
 const sprite_batcher_mod = @import("sprite_batcher.zig");
 const texture_atlas_mod = @import("texture_atlas.zig");
+const culling_mod = @import("culling.zig");
 const font_mod = @import("Font.zig");
 const panel_mod = @import("ui/Panel.zig");
 const minimap_mod = @import("ui/Minimap.zig");
@@ -196,6 +197,9 @@ pub const App = struct {
     /// clicks land on the wrong icon.
     view_w: f32 = @floatFromInt(WINDOW_WIDTH),
     view_h: f32 = @floatFromInt(WINDOW_HEIGHT),
+    /// Scratch bitmap for viewport-culling dedup (sized to map tile count / 8).
+    /// Allocated once in initGL; cleared each frame by `visibleTiles`.
+    cull_visited: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, map_w: u16, map_h: u16, opts: AppOptions) !App {
         var game_state = try Game.init(allocator, map_w, map_h, 1, .{
@@ -251,6 +255,7 @@ pub const App = struct {
         self.sprite_batcher.deinit();
         self.map_renderer.deinit();
         self.shader.deinit();
+        if (self.cull_visited.len > 0) self.allocator.free(self.cull_visited);
         self.game.deinit();
     }
 
@@ -490,6 +495,13 @@ pub const App = struct {
         try self.sprite_batcher.initGL();
         try self.map_renderer.init(&self.game.state.map);
 
+        // Allocate the viewport-culling visited bitmap (1 bit per tile).
+        const tile_count = self.game.state.map.tileCount();
+        const bmp_bytes = (tile_count + 7) / 8;
+        if (bmp_bytes > 0) {
+            self.cull_visited = self.allocator.alloc(u8, bmp_bytes) catch &.{};
+        }
+
         self.initialized = true;
     }
 
@@ -528,28 +540,15 @@ pub const App = struct {
             if (self.atlas_loaded and self.atlas.uploaded) {
                 self.atlas.setFilter(false); // nearest
             }
-            // Render objects (waves, roads, scene) at each torus offset so they
-            // wrap seamlessly along with the terrain.
-            const mw = @as(f32, @floatFromInt(self.game.state.map.width)) * map_renderer_mod.TileWidth;
-            const mh = @as(f32, @floatFromInt(self.game.state.map.height)) * map_renderer_mod.TileHeight;
-            const offsets = [9][2]f32{
-                .{ -mw, -mh }, .{ 0.0, -mh }, .{ mw, -mh },
-                .{ -mw, 0.0 }, .{ 0.0, 0.0 }, .{ mw, 0.0 },
-                .{ -mw, mh },  .{ 0.0, mh },  .{ mw, mh },
-            };
-            const saved_cx = self.camera.x;
-            const saved_cy = self.camera.y;
-            for (offsets) |off| {
-                self.camera.x = saved_cx + off[0];
-                self.camera.y = saved_cy + off[1];
-                self.camera.matrices_dirty = true;
-                self.renderWaves(const_tick);
-                self.renderRoads();
-                self.renderMapObjects();
-                self.renderBuildings();
-            }
-            self.camera.x = saved_cx;
-            self.camera.y = saved_cy;
+            // Render objects (waves, roads, buildings, map objects) in a single
+            // culled pass. The tile iterator handles torus wrapping, so no 3×3
+            // offset loop is needed on the CPU side (the terrain renderer keeps
+            // its 9-offset GPU draw since the VBO is static and GPU clipping is
+            // cheap).
+            self.renderWaves(const_tick);
+            self.renderRoads();
+            self.renderMapObjects();
+            self.renderBuildings();
             self.camera.matrices_dirty = true;
 
             // Render UI overlay (HUD + minimap + building ghost)
@@ -610,35 +609,52 @@ pub const App = struct {
 
         batcher.begin();
 
-        // Collect only tiles that have a standing object. The array is sized
-        // to the full tile count (worst case) but most tiles are empty.
-        const a = std.heap.page_allocator;
-        const list = a.alloc(SceneItem, map.tileCount()) catch null;
-        defer if (list) |l| a.free(l);
+        // Viewport culling: only iterate tiles that are visible through the
+        // camera, instead of the entire map. The iterator handles torus
+        // wrapping, so a single pass covers the visible area (no 3×3 loop).
+        const b = cam.visibleWorldBounds();
+        const num_visible = culling_mod.visibleTiles(
+            b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited,
+        );
+        // Upper bound on visible tiles for the sort buffer.
+        const max_visible = num_visible.row_hi - num_visible.row_lo + 1 +
+            num_visible.col_hi - num_visible.col_lo + 1;
+        _ = max_visible;
 
-        if (list) |l| {
-            var n: usize = 0;
-            for (0..map.height) |yy| {
-                for (0..map.width) |xx| {
-                    const t = map.getTileXY(@intCast(xx), @intCast(yy));
-                    if (t.object == .none) continue;
-                    const oh: f32 = @floatFromInt(t.height);
-                    l[n] = .{
-                        .baseline = @as(f32, @floatFromInt(yy)) * th - map_renderer_mod.HEIGHT_SCALE * oh,
-                        .x = @intCast(xx),
-                        .y = @intCast(yy),
-                    };
-                    n += 1;
-                }
+        // Collect visible tiles that have a standing object, then sort.
+        // Use a stack buffer large enough for a typical zoomed view; fall back
+        // to a heap allocation for very zoomed-out views.
+        var stack_buf: [4096]SceneItem = undefined;
+        var list: []SceneItem = stack_buf[0..];
+        var heap_list: ?[]SceneItem = null;
+        const cap = stack_buf.len;
+        if (cap == 0) {
+            heap_list = std.heap.page_allocator.alloc(SceneItem, 8192) catch null;
+            if (heap_list) |hl| list = hl;
+        }
+        defer if (heap_list) |hl| std.heap.page_allocator.free(hl);
+
+        var n: usize = 0;
+        var it = num_visible;
+        while (it.next()) |pos| {
+            if (n >= list.len) break;
+            const t = map.getTile(pos);
+            if (t.object == .none) continue;
+            const oh: f32 = @floatFromInt(t.height);
+            list[n] = .{
+                .baseline = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * oh,
+                .x = pos.x,
+                .y = pos.y,
+            };
+            n += 1;
+        }
+        std.mem.sort(SceneItem, list[0..n], {}, struct {
+            fn lt(_: void, p: SceneItem, q: SceneItem) bool {
+                return p.baseline < q.baseline;
             }
-            std.mem.sort(SceneItem, l[0..n], {}, struct {
-                fn lt(_: void, p: SceneItem, q: SceneItem) bool {
-                    return p.baseline < q.baseline;
-                }
-            }.lt);
-            for (l[0..n]) |e| {
-                self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
-            }
+        }.lt);
+        for (list[0..n]) |e| {
+            self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
         }
 
         if (self.atlas_loaded and self.atlas.uploaded) {
@@ -754,21 +770,20 @@ pub const App = struct {
 
         // Road segments: for each road/flag tile, connect to forward neighbours
         // that are also road/flag (forward dirs only, to avoid drawing twice).
-        // Uses WRAPPING so roads draw correctly across map edges.
+        // Uses viewport culling + wrapping so roads draw correctly across edges.
         const fwd = [_]core.Direction{ .right, .down_right, .down };
-        for (0..map.height) |yy| {
-            for (0..map.width) |xx| {
-                const pos = core.MapPos{ .x = @intCast(xx), .y = @intCast(yy) };
-                const t = map.getTile(pos);
-                if (!(t.has_road or t.has_flag)) continue;
-                const c0 = self.tileCenter(pos);
-                for (fwd) |d| {
-                    const np = map.getNeighborWrapped(pos, d);
-                    const nt = map.getTile(np);
-                    if (!(nt.has_road or nt.has_flag)) continue;
-                    const c1 = self.tileCenter(np);
-                    addLine(batcher, c0[0], c0[1], c1[0], c1[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
-                }
+        const b = self.camera.visibleWorldBounds();
+        var it = culling_mod.visibleTiles(b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited);
+        while (it.next()) |pos| {
+            const t = map.getTile(pos);
+            if (!(t.has_road or t.has_flag)) continue;
+            const c0 = self.tileCenter(pos);
+            for (fwd) |d| {
+                const np = map.getNeighborWrapped(pos, d);
+                const nt = map.getTile(np);
+                if (!(nt.has_road or nt.has_flag)) continue;
+                const c1 = self.tileCenter(np);
+                addLine(batcher, c0[0], c0[1], c1[0], c1[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
             }
         }
 
@@ -895,32 +910,34 @@ pub const App = struct {
 
         batcher.begin();
         var drew = false;
-        for (0..map.height) |yy| {
-            for (0..map.width) |xx| {
-                const tile = map.getTileXY(@intCast(xx), @intCast(yy));
-                if (tile.terrain != .water) continue;
-                // Skip shoreline tiles to avoid waves spilling onto land.
-                // Uses wrapping so edge water checks neighbours across the seam.
-                const xxi: i32 = @intCast(xx);
-                const yyi: i32 = @intCast(yy);
-                if (!isWater(map, xxi + 1, yyi) or !isWater(map, xxi, yyi + 1) or
-                    !isWater(map, xxi + 1, yyi + 1)) continue;
-                const pos: u64 = @as(u64, yy) * map.width + xx;
-                const frame: u16 = @intCast(((pos ^ 5) + (tick >> 3)) & 0xf);
-                const entry = self.atlas.get(630 + frame) orelse continue;
-                const wx = @as(f32, @floatFromInt(xx)) * tw - @as(f32, @floatFromInt(yy)) * hw;
-                const wy = @as(f32, @floatFromInt(yy)) * th -
-                    map_renderer_mod.HEIGHT_SCALE * @as(f32, @floatFromInt(tile.height));
-                batcher.add(.{
-                    .x = wx - hw,
-                    .y = wy,
-                    .width = @floatFromInt(entry.pixel_w),
-                    .height = @floatFromInt(entry.pixel_h),
-                    .u = entry.u, .v = entry.v, .uw = entry.uw, .vh = entry.vh,
-                    .r = 1, .g = 1, .b = 1, .a = 1,
-                });
-                drew = true;
-            }
+        const b = cam.visibleWorldBounds();
+        var it = culling_mod.visibleTiles(b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited);
+        while (it.next()) |tile_pos| {
+            const xx: u16 = tile_pos.x;
+            const yy: u16 = tile_pos.y;
+            const tile = map.getTileXY(xx, yy);
+            if (tile.terrain != .water) continue;
+            // Skip shoreline tiles to avoid waves spilling onto land.
+            // Uses wrapping so edge water checks neighbours across the seam.
+            const xxi: i32 = @intCast(xx);
+            const yyi: i32 = @intCast(yy);
+            if (!isWater(map, xxi + 1, yyi) or !isWater(map, xxi, yyi + 1) or
+                !isWater(map, xxi + 1, yyi + 1)) continue;
+            const lin: u64 = @as(u64, yy) * map.width + xx;
+            const frame: u16 = @intCast(((lin ^ 5) + (tick >> 3)) & 0xf);
+            const entry = self.atlas.get(630 + frame) orelse continue;
+            const wx = @as(f32, @floatFromInt(xx)) * tw - @as(f32, @floatFromInt(yy)) * hw;
+            const wy = @as(f32, @floatFromInt(yy)) * th -
+                map_renderer_mod.HEIGHT_SCALE * @as(f32, @floatFromInt(tile.height));
+            batcher.add(.{
+                .x = wx - hw,
+                .y = wy,
+                .width = @floatFromInt(entry.pixel_w),
+                .height = @floatFromInt(entry.pixel_h),
+                .u = entry.u, .v = entry.v, .uw = entry.uw, .vh = entry.vh,
+                .r = 1, .g = 1, .b = 1, .a = 1,
+            });
+            drew = true;
         }
         if (!drew) return;
         var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
