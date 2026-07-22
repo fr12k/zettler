@@ -599,6 +599,13 @@ pub const App = struct {
     /// screen baseline. Drawn in its OWN batch flush so a large number of trees
     /// can never fill the batcher and crowd out the buildings (which are drawn
     /// in a separate pass by `renderBuildings`).
+    /// Configure the sprite batcher to auto-flush (draw + reset) when its
+    /// buffer fills up, instead of silently dropping sprites. `tex` is the
+    /// texture that will be used for the flush (atlas or white fallback).
+    fn setupAutoFlush(self: *App, batcher: *SpriteBatcher, tex: *Texture) void {
+        batcher.setAutoFlush(&self.shader, tex, &self.camera);
+    }
+
     fn renderMapObjects(self: *App) void {
         const batcher = &self.sprite_batcher;
         const cam = &self.camera;
@@ -607,6 +614,11 @@ pub const App = struct {
         const hw: f32 = tw / 2.0;
         const map = &self.game.state.map;
 
+        // Set up the texture used for both the final render and auto-flush.
+        var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
+        var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
+        const tex: *Texture = if (self.atlas_loaded and self.atlas.uploaded) &atlas_tex else &white_tex;
+        self.setupAutoFlush(batcher, tex);
         batcher.begin();
 
         // Viewport culling: only iterate tiles that are visible through the
@@ -657,13 +669,7 @@ pub const App = struct {
             self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
         }
 
-        if (self.atlas_loaded and self.atlas.uploaded) {
-            var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
-            batcher.render(&self.shader, &atlas_tex, cam);
-        } else {
-            var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
-            batcher.render(&self.shader, &white_tex, cam);
-        }
+        batcher.render(&self.shader, tex, cam);
     }
 
     /// Render all buildings, sorted back-to-front by screen baseline. Drawn in
@@ -678,6 +684,11 @@ pub const App = struct {
         const map = &self.game.state.map;
         const items = self.game.state.buildings.buildings.items;
 
+        // Set up the texture used for both the final render and auto-flush.
+        var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
+        var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
+        const tex: *Texture = if (self.atlas_loaded and self.atlas.uploaded) &atlas_tex else &white_tex;
+        self.setupAutoFlush(batcher, tex);
         batcher.begin();
 
         // A small stack array is enough — the number of buildings is tiny
@@ -702,13 +713,7 @@ pub const App = struct {
             self.drawBuilding(batcher, &items[e.bidx], tw, th, hw);
         }
 
-        if (self.atlas_loaded and self.atlas.uploaded) {
-            var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
-            batcher.render(&self.shader, &atlas_tex, cam);
-        } else {
-            var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
-            batcher.render(&self.shader, &white_tex, cam);
-        }
+        batcher.render(&self.shader, tex, cam);
     }
 
     /// Draw one standing map object (tree/rock) with its shadow.
