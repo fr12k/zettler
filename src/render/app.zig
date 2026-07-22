@@ -545,7 +545,8 @@ pub const App = struct {
                 self.camera.matrices_dirty = true;
                 self.renderWaves(const_tick);
                 self.renderRoads();
-                self.renderScene();
+                self.renderMapObjects();
+                self.renderBuildings();
             }
             self.camera.x = saved_cx;
             self.camera.y = saved_cy;
@@ -586,46 +587,37 @@ pub const App = struct {
         self.camera.wrap(mw, mh);
     }
 
-    /// One drawable in the world scene: either a building (by index) or a
-    /// standing map object on a tile (by x,y). `baseline` is the screen-space y
-    /// used to sort back-to-front.
+    /// One drawable standing object (tree/rock) on a tile. `baseline` is the
+    /// screen-space y used to sort back-to-front so nearer sprites and their
+    /// shadows correctly occlude farther ones.
     const SceneItem = struct {
         baseline: f32,
-        is_building: bool,
-        bidx: u32 = 0,
         x: u16 = 0,
         y: u16 = 0,
     };
 
-    /// Render the world scene: buildings and standing map objects (trees/rocks),
-    /// interleaved and sorted back-to-front by screen baseline so nearer sprites
-    /// and their shadows correctly occlude farther ones.
-    fn renderScene(self: *App) void {
+    /// Render all standing map objects (trees/rocks), sorted back-to-front by
+    /// screen baseline. Drawn in its OWN batch flush so a large number of trees
+    /// can never fill the batcher and crowd out the buildings (which are drawn
+    /// in a separate pass by `renderBuildings`).
+    fn renderMapObjects(self: *App) void {
         const batcher = &self.sprite_batcher;
         const cam = &self.camera;
         const tw: f32 = map_renderer_mod.TileWidth;
         const th: f32 = map_renderer_mod.TileHeight;
         const hw: f32 = tw / 2.0;
         const map = &self.game.state.map;
-        const items = self.game.state.buildings.buildings.items;
 
         batcher.begin();
 
+        // Collect only tiles that have a standing object. The array is sized
+        // to the full tile count (worst case) but most tiles are empty.
         const a = std.heap.page_allocator;
-        const list = a.alloc(SceneItem, items.len + map.tileCount()) catch null;
+        const list = a.alloc(SceneItem, map.tileCount()) catch null;
         defer if (list) |l| a.free(l);
 
         if (list) |l| {
             var n: usize = 0;
-            for (items, 0..) |*b, i| {
-                const bh: f32 = @floatFromInt(map.getTile(b.pos).height);
-                l[n] = .{
-                    .baseline = @as(f32, @floatFromInt(b.pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * bh,
-                    .is_building = true,
-                    .bidx = @intCast(i),
-                };
-                n += 1;
-            }
             for (0..map.height) |yy| {
                 for (0..map.width) |xx| {
                     const t = map.getTileXY(@intCast(xx), @intCast(yy));
@@ -633,7 +625,6 @@ pub const App = struct {
                     const oh: f32 = @floatFromInt(t.height);
                     l[n] = .{
                         .baseline = @as(f32, @floatFromInt(yy)) * th - map_renderer_mod.HEIGHT_SCALE * oh,
-                        .is_building = false,
                         .x = @intCast(xx),
                         .y = @intCast(yy),
                     };
@@ -646,15 +637,53 @@ pub const App = struct {
                 }
             }.lt);
             for (l[0..n]) |e| {
-                if (e.is_building) {
-                    self.drawBuilding(batcher, &items[e.bidx], tw, th, hw);
-                } else {
-                    self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
-                }
+                self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
             }
+        }
+
+        if (self.atlas_loaded and self.atlas.uploaded) {
+            var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
+            batcher.render(&self.shader, &atlas_tex, cam);
         } else {
-            // Allocation failed: draw buildings unsorted (still correct).
-            for (items) |*b| self.drawBuilding(batcher, b, tw, th, hw);
+            var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
+            batcher.render(&self.shader, &white_tex, cam);
+        }
+    }
+
+    /// Render all buildings, sorted back-to-front by screen baseline. Drawn in
+    /// its OWN batch flush (separate from `renderMapObjects`) so trees can never
+    /// fill the batcher and cause buildings to be silently dropped.
+    fn renderBuildings(self: *App) void {
+        const batcher = &self.sprite_batcher;
+        const cam = &self.camera;
+        const tw: f32 = map_renderer_mod.TileWidth;
+        const th: f32 = map_renderer_mod.TileHeight;
+        const hw: f32 = tw / 2.0;
+        const map = &self.game.state.map;
+        const items = self.game.state.buildings.buildings.items;
+
+        batcher.begin();
+
+        // A small stack array is enough — the number of buildings is tiny
+        // (the demo scene places 9; real games have hundreds at most).
+        var buf: [256]struct { baseline: f32, bidx: u32 } = undefined;
+        var n: usize = 0;
+        for (items, 0..) |*b, i| {
+            if (n >= buf.len) break;
+            const bh: f32 = @floatFromInt(map.getTile(b.pos).height);
+            buf[n] = .{
+                .baseline = @as(f32, @floatFromInt(b.pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * bh,
+                .bidx = @intCast(i),
+            };
+            n += 1;
+        }
+        std.mem.sort(@TypeOf(buf[0]), buf[0..n], {}, struct {
+            fn lt(_: void, p: @TypeOf(buf[0]), q: @TypeOf(buf[0])) bool {
+                return p.baseline < q.baseline;
+            }
+        }.lt);
+        for (buf[0..n]) |e| {
+            self.drawBuilding(batcher, &items[e.bidx], tw, th, hw);
         }
 
         if (self.atlas_loaded and self.atlas.uploaded) {

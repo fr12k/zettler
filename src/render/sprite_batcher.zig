@@ -9,9 +9,11 @@ const Shader = @import("Shader.zig").Shader;
 const Texture = @import("Texture.zig").Texture;
 const Camera = @import("Camera.zig").Camera;
 
-/// Maximum number of sprites per batch. Large enough to hold a whole map's
-/// worth of trees/rocks + buildings (each with a shadow) in one scene batch.
-pub const MAX_SPRITES: usize = 16384;
+/// Maximum number of sprites per batch flush. Large enough to hold a whole
+/// 1024×1024 map's worth of trees/rocks (each with a shadow) in one scene
+/// batch. The batcher auto-flushes when full (see `add`), so this is a
+/// throughput hint, not a hard correctness cap.
+pub const MAX_SPRITES: usize = 65536;
 pub const MAX_VERTICES: usize = MAX_SPRITES * 4;
 pub const MAX_INDICES: usize = MAX_SPRITES * 6;
 
@@ -35,7 +37,7 @@ pub const SpriteVertex = packed struct {
 pub const SpriteBatcher = struct {
     allocator: std.mem.Allocator,
     vertices: []SpriteVertex = &.{},
-    indices: []u16 = &.{},
+    indices: []u32 = &.{},
     sprite_count: usize = 0,
     vbo: gl.GLuint = 0,
     ibo: gl.GLuint = 0,
@@ -56,9 +58,9 @@ pub const SpriteBatcher = struct {
 
     pub fn initGL(self: *SpriteBatcher) !void {
         self.vertices = try self.allocator.alloc(SpriteVertex, MAX_VERTICES);
-        self.indices = try self.allocator.alloc(u16, MAX_INDICES);
+        self.indices = try self.allocator.alloc(u32, MAX_INDICES);
         for (0..MAX_SPRITES) |i| {
-            const vi = @as(u16, @intCast(i * 4));
+            const vi: u32 = @intCast(i * 4);
             const ii = i * 6;
             self.indices[ii + 0] = vi + 0;
             self.indices[ii + 1] = vi + 1;
@@ -150,7 +152,7 @@ pub const SpriteBatcher = struct {
         gl.enableVertexAttribArray(2);
         gl.vertexAttribPointer(2, 4, gl.GL_FLOAT, gl.GL_FALSE, stride, 16);
 
-        gl.drawElements(gl.GL_TRIANGLES, @intCast(self.sprite_count * 6), gl.GL_UNSIGNED_SHORT, 0);
+        gl.drawElements(gl.GL_TRIANGLES, @intCast(self.sprite_count * 6), gl.GL_UNSIGNED_INT, 0);
 
         gl.disableVertexAttribArray(0);
         gl.disableVertexAttribArray(1);
