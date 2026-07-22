@@ -380,9 +380,9 @@ pub const MapRenderer = struct {
 
     /// Render the terrain with torus wrapping.
     ///
-    /// Draws the map at up to 4 offsets: (0,0), (+mapW,0), (0,+mapH), (+mapW,+mapH)
-    /// so that wherever the camera is, the visible area is fully covered with
-    /// seamless wrapping tiles.
+    /// Draws the map at 9 offsets (a 3×3 grid around the camera) so that
+    /// wherever the camera is, the visible area is fully covered with
+    /// seamless wrapping tiles. The GPU clips offscreen geometry.
     pub fn render(self: *MapRenderer, camera: *Camera) void {
         if (!self.initialized) return;
 
@@ -390,15 +390,13 @@ pub const MapRenderer = struct {
         const mh = self.map_pixel_height;
         if (mw <= 0 or mh <= 0) return;
 
-        // Determine which offset copies we need to draw based on camera position.
-        // We need to draw the map at offset (0,0) and possibly at ±mw/±mh offsets
-        // to cover the viewport. We draw all 4 quadrant copies for simplicity —
-        // the GPU culls what's offscreen.
-        const offsets = [4][2]f32{
-            .{ 0.0, 0.0 },
-            .{ mw, 0.0 },
-            .{ 0.0, mh },
-            .{ mw, mh },
+        // 3×3 grid of offsets ensures seamless wrapping in all directions.
+        // When the camera is near the left/top edge, we need negative offsets
+        // to cover the viewport extending past the wrap seam.
+        const offsets = [9][2]f32{
+            .{ -mw, -mh }, .{ 0.0, -mh }, .{ mw, -mh },
+            .{ -mw, 0.0 }, .{ 0.0, 0.0 }, .{ mw, 0.0 },
+            .{ -mw, mh },  .{ 0.0, mh },  .{ mw, mh },
         };
 
         camera.updateMatrices();
