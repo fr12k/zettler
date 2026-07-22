@@ -37,64 +37,94 @@ const Options = struct {
 /// Parse command-line arguments for map dimensions.
 /// Supported forms:
 ///   --map-size <W> <H>    e.g. --map-size 256 256
-///   --map-size=WxH          e.g. --map-size=256x256
+///   --map-size=WxH          e.g. --map-size=256x256  (also accepts 'X')
 ///   --map-w <W> --map-h <H>
-fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Options {
+///
+/// On malformed input a message is printed to stderr and the default
+/// (64×64) is kept. `parseArgs` itself never returns an error — the only
+/// fallible call (`Args.Iterator.initAllocator`) is handled inside.
+fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) Options {
     var opts = Options{};
-    var args_it = try std.process.Args.Iterator.initAllocator(args, allocator);
+    var args_it = std.process.Args.Iterator.initAllocator(args, allocator) catch {
+        std.debug.print("Failed to read command-line arguments; using defaults.\n", .{});
+        return opts;
+    };
     defer args_it.deinit();
     _ = args_it.next(); // skip program name
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--map-size")) {
+            // Parse both values into temporaries and only commit to `opts`
+            // when both succeed, so a bad height does not leave a lopsided
+            // (w, default-h) map behind.
             const w_str = args_it.next() orelse {
                 std.debug.print("--map-size requires <width> <height>\n", .{});
-                return opts;
+                continue;
             };
             const h_str = args_it.next() orelse {
                 std.debug.print("--map-size requires <width> <height>\n", .{});
-                return opts;
+                continue;
             };
-            opts.map_w = std.fmt.parseInt(u16, w_str, 10) catch {
+            if (looksLikeFlag(w_str) or looksLikeFlag(h_str)) {
+                std.debug.print("--map-size: '{s}' / '{s}' look like flags, not sizes\n", .{ w_str, h_str });
+                continue;
+            }
+            const w = std.fmt.parseInt(u16, w_str, 10) catch {
                 std.debug.print("Invalid map width '{s}'\n", .{w_str});
-                return opts;
+                continue;
             };
-            opts.map_h = std.fmt.parseInt(u16, h_str, 10) catch {
+            const h = std.fmt.parseInt(u16, h_str, 10) catch {
                 std.debug.print("Invalid map height '{s}'\n", .{h_str});
-                return opts;
+                continue;
             };
+            opts.map_w = w;
+            opts.map_h = h;
         } else if (std.mem.startsWith(u8, arg, "--map-size=")) {
             const rest = arg["--map-size=".len..];
-            if (std.mem.indexOfScalar(u8, rest, 'x')) |sep| {
-                opts.map_w = std.fmt.parseInt(u16, rest[0..sep], 10) catch {
+            // Accept both 'x' and 'X' as the width/height separator.
+            const sep = std.mem.indexOfScalar(u8, rest, 'x') orelse
+                std.mem.indexOfScalar(u8, rest, 'X');
+            if (sep) |s| {
+                const w = std.fmt.parseInt(u16, rest[0..s], 10) catch {
                     std.debug.print("Invalid map size '{s}'\n", .{rest});
-                    return opts;
+                    continue;
                 };
-                opts.map_h = std.fmt.parseInt(u16, rest[sep + 1 ..], 10) catch {
+                const h = std.fmt.parseInt(u16, rest[s + 1 ..], 10) catch {
                     std.debug.print("Invalid map size '{s}'\n", .{rest});
-                    return opts;
+                    continue;
                 };
+                opts.map_w = w;
+                opts.map_h = h;
             } else {
                 std.debug.print("--map-size=WxH: missing 'x' separator in '{s}'\n", .{rest});
-                return opts;
             }
         } else if (std.mem.eql(u8, arg, "--map-w")) {
             const w_str = args_it.next() orelse {
                 std.debug.print("--map-w requires a width\n", .{});
-                return opts;
+                continue;
             };
-            opts.map_w = std.fmt.parseInt(u16, w_str, 10) catch {
+            if (looksLikeFlag(w_str)) {
+                std.debug.print("--map-w: '{s}' looks like a flag, not a width\n", .{w_str});
+                continue;
+            }
+            if (std.fmt.parseInt(u16, w_str, 10)) |w| {
+                opts.map_w = w;
+            } else |_| {
                 std.debug.print("Invalid map width '{s}'\n", .{w_str});
-                return opts;
-            };
+            }
         } else if (std.mem.eql(u8, arg, "--map-h")) {
             const h_str = args_it.next() orelse {
                 std.debug.print("--map-h requires a height\n", .{});
-                return opts;
+                continue;
             };
-            opts.map_h = std.fmt.parseInt(u16, h_str, 10) catch {
+            if (looksLikeFlag(h_str)) {
+                std.debug.print("--map-h: '{s}' looks like a flag, not a height\n", .{h_str});
+                continue;
+            }
+            if (std.fmt.parseInt(u16, h_str, 10)) |h| {
+                opts.map_h = h;
+            } else |_| {
                 std.debug.print("Invalid map height '{s}'\n", .{h_str});
-                return opts;
-            };
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
@@ -116,6 +146,13 @@ fn parseArgs(args: std.process.Args, allocator: std.mem.Allocator) !Options {
         );
     }
     return opts;
+}
+
+/// Heuristic: a token starting with "--" is treated as a flag, not a value.
+/// Prevents `--map-size 256 --fullscreen` from eating `--fullscreen` as the
+/// height argument.
+fn looksLikeFlag(s: []const u8) bool {
+    return s.len >= 2 and s[0] == '-' and s[1] == '-';
 }
 
 fn printUsage() void {
@@ -141,7 +178,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const opts = try parseArgs(init.args, allocator);
+    const opts = parseArgs(init.args, allocator);
     std.debug.print("Map size: {d}x{d}\n", .{ opts.map_w, opts.map_h });
 
     // Try GLFW first, fall back to terminal demo
