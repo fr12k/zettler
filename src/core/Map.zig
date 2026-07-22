@@ -158,18 +158,18 @@ pub const Map = struct {
     // ── Torus (wrapping) coordinate helpers ──────────────────────────
 
     /// Wrap an x coordinate into [0, width). Supports negative and overflow values.
+    /// Uses integer @mod which always returns non-negative results.
     pub fn wrapX(self: Map, x: i32) u16 {
         const w: i32 = @intCast(self.width);
-        var result: i32 = @intFromFloat(@mod(@as(f64, @floatFromInt(x)), @as(f64, @floatFromInt(w))));
-        if (result < 0) result += w;
+        const result: i32 = @mod(x, w);
         return @intCast(result);
     }
 
     /// Wrap a y coordinate into [0, height). Supports negative and overflow values.
+    /// Uses integer @mod which always returns non-negative results.
     pub fn wrapY(self: Map, y: i32) u16 {
         const h: i32 = @intCast(self.height);
-        var result: i32 = @intFromFloat(@mod(@as(f64, @floatFromInt(y)), @as(f64, @floatFromInt(h))));
-        if (result < 0) result += h;
+        const result: i32 = @mod(y, h);
         return @intCast(result);
     }
 
@@ -290,10 +290,6 @@ pub const Map = struct {
         // Build a seeded permutation table for Perlin noise.
         const perm = noise_mod.Permutation.init(seed);
 
-        // Noise scale: controls feature size relative to map dimensions.
-        // Higher = larger features, lower = more detail.
-        const scale: f64 = 6.0;
-
         // 1. Generate height field using periodic Perlin noise.
         //    The noise is evaluated at (x * scale / w, y * scale / h) so that
         //    one period of noise spans the entire map, making edges tile.
@@ -315,10 +311,13 @@ pub const Map = struct {
             for (0..self.width) |x| {
                 const fx: f64 = @floatFromInt(x);
                 const fy: f64 = @floatFromInt(y);
-                // Primary height noise (4 octaves for natural-looking terrain)
+                // Primary height noise (4 octaves for natural-looking terrain).
+                // Input is raw tile coordinates with period = map dimensions,
+                // so the noise tiles seamlessly at the map edges.
+                // Scale factor controls feature size: scale=1 means each noise
+                // cell covers one tile; scale=0.5 gives larger features.
                 const height_noise = noise_mod.fbm_perlin2d(
-                    fx * scale / @as(f64, @floatFromInt(w)),
-                    fy * scale / @as(f64, @floatFromInt(h)),
+                    fx, fy,
                     perm, w, h, 4,
                 );
                 const idx = @as(usize, y) * @as(usize, self.width) + @as(usize, x);

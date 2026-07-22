@@ -77,28 +77,36 @@ pub const Permutation = struct {
 /// Returns a value in approximately [-1, 1].
 pub fn perlin2d(x: f64, y: f64, perm: Permutation, period_x: u32, period_y: u32) f64 {
     // Determine unit grid cell containing (x, y)
-    var xi: u32 = @intFromFloat(@floor(x));
-    var yi: u32 = @intFromFloat(@floor(y));
-    const xf = x - @floor(x);
-    const yf = y - @floor(y);
+    // Use i32 for floor to handle negative coordinates correctly.
+    const fx: f64 = @floor(x);
+    const fy: f64 = @floor(y);
+    var xi: i32 = @intFromFloat(fx);
+    var yi: i32 = @intFromFloat(fy);
+    const xf = x - fx;
+    const yf = y - fy;
 
-    // Apply periodic wrapping to integer coordinates
-    if (period_x > 0) xi = xi % period_x;
-    if (period_y > 0) yi = yi % period_y;
+    // Apply periodic wrapping to integer coordinates using modular arithmetic.
+    // @mod on i32 always returns a non-negative result, which is what we need.
+    if (period_x > 0) xi = @mod(xi, @as(i32, @intCast(period_x)));
+    if (period_y > 0) yi = @mod(yi, @as(i32, @intCast(period_y)));
+
+    // Convert to u32 for permutation table lookup (now guaranteed non-negative).
+    const ux: u32 = @intCast(xi);
+    const uy: u32 = @intCast(yi);
 
     // Neighbours — wrap at the period
-    const xi1: u32 = if (period_x > 0) (xi + 1) % period_x else xi + 1;
-    const yi1: u32 = if (period_y > 0) (yi + 1) % period_y else yi + 1;
+    const ux1: u32 = if (period_x > 0) (ux + 1) % period_x else ux + 1;
+    const uy1: u32 = if (period_y > 0) (uy + 1) % period_y else uy + 1;
 
     // Fade curves for interpolation
     const u = fade(xf);
     const v = fade(yf);
 
     // Gradients at the four corners
-    const n00 = perm.grad(xi, yi, xf, yf);
-    const n10 = perm.grad(xi1, yi, xf - 1.0, yf);
-    const n01 = perm.grad(xi, yi1, xf, yf - 1.0);
-    const n11 = perm.grad(xi1, yi1, xf - 1.0, yf - 1.0);
+    const n00 = perm.grad(ux, uy, xf, yf);
+    const n10 = perm.grad(ux1, uy, xf - 1.0, yf);
+    const n01 = perm.grad(ux, uy1, xf, yf - 1.0);
+    const n11 = perm.grad(ux1, uy1, xf - 1.0, yf - 1.0);
 
     // Bilinear interpolation
     const nx0 = n00 + u * (n10 - n00);

@@ -405,27 +405,31 @@ pub const MapRenderer = struct {
         // 14 floats = 56 bytes.
         const stride: i32 = @sizeOf(Vertex);
 
+        // Set up GL state once — projection and modelview don't change per offset.
+        self.shader.use();
+        self.shader.setTexture(0);
+        self.shader.setColor(1, 1, 1, 1);
+        self.shader.setProjection(&camera.projection);
+        self.shader.setModelview(&camera.modelview);
+
+        // Pass 1: Base terrain (all tiles) at all 9 offsets.
+        self.shader.setUseMask(0);
+        gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.vbo);
+        bindTerrainAttribs(stride);
+        gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ibo);
         for (offsets) |off| {
-            self.shader.use();
-            self.shader.setTexture(0);
-            self.shader.setColor(1, 1, 1, 1);
             self.shader.setOffset(off[0], off[1]);
-            self.shader.setProjection(&camera.projection);
-            self.shader.setModelview(&camera.modelview);
-
-            // Pass 1: clean solid base over ALL tiles.
-            self.shader.setUseMask(0);
-            gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.vbo);
-            bindTerrainAttribs(stride);
-            gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ibo);
             gl.drawElements(gl.GL_TRIANGLES, @intCast(self.index_count), gl.GL_UNSIGNED_SHORT, 0);
+        }
 
-            // Pass 2: dithered overlay over BOUNDARY tiles only.
-            if (self.overlay_index_count > 0) {
-                self.shader.setUseMask(1);
-                gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.overlay_vbo);
-                bindTerrainAttribs(stride);
-                gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.overlay_ibo);
+        // Pass 2: Overlay (boundary tiles only) at all 9 offsets.
+        if (self.overlay_index_count > 0) {
+            self.shader.setUseMask(1);
+            gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.overlay_vbo);
+            bindTerrainAttribs(stride);
+            gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.overlay_ibo);
+            for (offsets) |off| {
+                self.shader.setOffset(off[0], off[1]);
                 gl.drawElements(gl.GL_TRIANGLES, @intCast(self.overlay_index_count), gl.GL_UNSIGNED_SHORT, 0);
             }
         }
