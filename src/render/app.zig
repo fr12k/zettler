@@ -1068,7 +1068,7 @@ pub const App = struct {
         gl.vertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, 8);
         gl.enableVertexAttribArray(2);
         gl.vertexAttribPointer(2, 4, gl.GL_FLOAT, gl.GL_FALSE, stride, 16);
-        gl.drawElements(gl.GL_TRIANGLES, @intCast(batcher.sprite_count * 6), gl.GL_UNSIGNED_SHORT, 0);
+        gl.drawElements(gl.GL_TRIANGLES, @intCast(batcher.sprite_count * 6), gl.GL_UNSIGNED_INT, 0);
         gl.disableVertexAttribArray(0);
         gl.disableVertexAttribArray(1);
         gl.disableVertexAttribArray(2);
