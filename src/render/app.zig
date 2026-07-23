@@ -634,14 +634,19 @@ pub const App = struct {
         _ = max_visible;
 
         // Collect visible tiles that have a standing object, then sort.
-        // Use a stack buffer large enough for a typical zoomed view; fall back
-        // to a heap allocation for very zoomed-out views.
+        // Use a stack buffer for typical zoomed views; fall back to a heap
+        // allocation when zoomed out far enough that the visible tile count
+        // exceeds the stack capacity.
         var stack_buf: [4096]SceneItem = undefined;
+        const visible_tile_count: usize = blk: {
+            const rs = @as(usize, @intCast(num_visible.row_hi - num_visible.row_lo + 1));
+            const cs = @as(usize, @intCast(num_visible.col_hi - num_visible.col_lo + 1));
+            break :blk rs * cs;
+        };
         var list: []SceneItem = stack_buf[0..];
         var heap_list: ?[]SceneItem = null;
-        const cap = stack_buf.len;
-        if (cap == 0) {
-            heap_list = std.heap.page_allocator.alloc(SceneItem, 8192) catch null;
+        if (visible_tile_count > stack_buf.len) {
+            heap_list = std.heap.page_allocator.alloc(SceneItem, visible_tile_count) catch null;
             if (heap_list) |hl| list = hl;
         }
         defer if (heap_list) |hl| std.heap.page_allocator.free(hl);
@@ -691,25 +696,44 @@ pub const App = struct {
         self.setupAutoFlush(batcher, tex);
         batcher.begin();
 
-        // A small stack array is enough — the number of buildings is tiny
-        // (the demo scene places 9; real games have hundreds at most).
-        var buf: [256]struct { baseline: f32, bidx: u32 } = undefined;
+        // Viewport culling: skip buildings whose tile is outside the visible
+        // world bounds. Buildings are few, so we just filter — no tile
+        // iterator needed. Use a stack buffer for up to 1024 buildings;
+        // fall back to heap for pathological counts.
+        var stack_buf: [1024]struct { baseline: f32, bidx: u32 } = undefined;
+        const EntryType = @TypeOf(stack_buf[0]);
+        var list: []EntryType = stack_buf[0..];
+        var heap_list: ?[]EntryType = null;
+        if (items.len > stack_buf.len) {
+            heap_list = std.heap.page_allocator.alloc(EntryType, items.len) catch null;
+            if (heap_list) |hl| list = hl;
+        }
+        defer if (heap_list) |hl| std.heap.page_allocator.free(hl);
+
+        const b = cam.visibleWorldBounds();
         var n: usize = 0;
-        for (items, 0..) |*b, i| {
-            if (n >= buf.len) break;
-            const bh: f32 = @floatFromInt(map.getTile(b.pos).height);
-            buf[n] = .{
-                .baseline = @as(f32, @floatFromInt(b.pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * bh,
+        for (items, 0..) |*bld, i| {
+            if (n >= list.len) break;
+            // Cull buildings outside the visible world bounds (with a margin
+            // for the sprite footprint which extends above the tile).
+            const wx = @as(f32, @floatFromInt(bld.pos.x)) * tw - @as(f32, @floatFromInt(bld.pos.y)) * hw;
+            const wy = @as(f32, @floatFromInt(bld.pos.y)) * th;
+            const margin: f32 = tw * 4.0; // generous for tall building sprites
+            if (wx + margin < b.min_x or wx - margin > b.max_x or
+                wy + margin < b.min_y or wy - margin > b.max_y) continue;
+            const bh: f32 = @floatFromInt(map.getTile(bld.pos).height);
+            list[n] = .{
+                .baseline = @as(f32, @floatFromInt(bld.pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * bh,
                 .bidx = @intCast(i),
             };
             n += 1;
         }
-        std.mem.sort(@TypeOf(buf[0]), buf[0..n], {}, struct {
-            fn lt(_: void, p: @TypeOf(buf[0]), q: @TypeOf(buf[0])) bool {
+        std.mem.sort(EntryType, list[0..n], {}, struct {
+            fn lt(_: void, p: EntryType, q: EntryType) bool {
                 return p.baseline < q.baseline;
             }
         }.lt);
-        for (buf[0..n]) |e| {
+        for (list[0..n]) |e| {
             self.drawBuilding(batcher, &items[e.bidx], tw, th, hw);
         }
 
