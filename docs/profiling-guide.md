@@ -58,9 +58,8 @@ and is ~50× slower, which hides the real hot spots.
 # ReleaseFast WITH frame pointers (so perf can unwind the stack)
 zig build -Doptimize=ReleaseFast -Dno-bounds-check
 # Note: Zig 0.17 keeps frame pointers in ReleaseFast by default on x86-64,
-# which is what makes perf -g produce readable stacks (see the flamegraphs
-# in docs/perf-*-flamegraph.svg that were captured on a Debug build and
-# already show full Zig symbol names).
+# which is what makes perf -g produce readable stacks (a Debug build
+# already shows full Zig symbol names in the flamegraph).
 ```
 
 If you ever lose stack traces (e.g. after enabling aggressive stripping),
@@ -137,12 +136,9 @@ perl /tmp/FlameGraph/flamegraph.pl \
   steady.folded > docs/perf-steady-flamegraph.svg
 ```
 
-Open the SVG in a browser; it is interactive (click to zoom). Two
-flamegraphs are committed:
-
-- `docs/perf-startup-flamegraph.svg` — whole run (dominated by terrain
-  generation + atlas build)
-- `docs/perf-steady-flamegraph.svg` — render loop only
+Open the SVG in a browser; it is interactive (click to zoom). Generate
+a startup flamegraph the same way, replacing the `perf record` step with
+a whole-run capture (no `sleep`/`-p`):
 
 ### 3d. Per-function annotation (`perf annotate`)
 
