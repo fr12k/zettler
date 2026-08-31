@@ -31,11 +31,11 @@ func main() {
 
 func DockerFile() *protos2.ContainerFile {
 	return &protos2.ContainerFile{
-		Name: "0.17.0-dev-1267-300116b02-alpine",
+		Name: "0.17.0-dev-1683-5ceec001b-alpine",
 		Content: `FROM --platform=$TARGETPLATFORM alpine:3.24
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
-ARG ZIG_VERSION=0.17.0-dev.1267+300116b02
+ARG ZIG_VERSION=0.17.0-dev.1683+5ceec001b
 
 RUN apk add --no-cache curl xz glfw-dev && \
 	case "$TARGETPLATFORM" in \
