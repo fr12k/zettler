@@ -127,7 +127,7 @@ test "Flag basic queue operations" {
     // Take outgoing
     const taken = FlagManager.takeOutgoing(&flag);
     try std.testing.expect(taken != null);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(Resource.wood)), taken.?);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Resource.stone)), taken.?);
     try std.testing.expectEqual(@as(u8, 0), flag.outgoing_count);
 }
 

@@ -527,7 +527,7 @@ pub const Serf = struct {
 };
 
 test "Serf idle in stock" {
-    var state = try GameState.init(std.testing.allocator, 32, 32);
+    var state = try GameState.init(std.testing.allocator, 64, 64);
     defer state.deinit();
 
     var serf = SerfStateData{
@@ -540,7 +540,7 @@ test "Serf idle in stock" {
 }
 
 test "Serf lumberjack felling produces wood" {
-    var state = try GameState.init(std.testing.allocator, 32, 32);
+    var state = try GameState.init(std.testing.allocator, 64, 64);
     defer state.deinit();
     state.players.player_count = 1;
 
@@ -556,7 +556,7 @@ test "Serf lumberjack felling produces wood" {
 }
 
 test "Serf walking on land" {
-    var state = try GameState.init(std.testing.allocator, 32, 32);
+    var state = try GameState.init(std.testing.allocator, 64, 64);
     defer state.deinit();
 
     var serf = SerfStateData{

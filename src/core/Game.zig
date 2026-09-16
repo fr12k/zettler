@@ -251,12 +251,16 @@ pub const Game = struct {
     }
 
     /// Run one production cycle for a staffed building. Returns false if the
-    /// building stalled (gatherer with no resource in range), true if it
-    /// produced. Output is delivered straight to the owning player's stock for
-    /// now (simplified — no transporter walk yet).
+    /// building stalled (gatherer with no resource in range, or processor
+    /// with no input stock), true if it produced. Output goes into the
+    /// building's local stock (`resources`/`resource_types`);
+    /// `updateInventories` later moves it to the connected flag and onward to
+    /// the player's stock.
     fn tryProduce(self: *Game, building: *BuildingState) bool {
         const map = &self.state.map;
         const radius = 5;
+
+        // Gatherers interact with the map (consume a tree/rock, check water).
         switch (building.building_type) {
             // Lumberjack: fell the nearest tree (removing it).
             .lumberjack => {
@@ -268,8 +272,9 @@ pub const Game = struct {
                 const t = map.findNearestObject(building.pos, radius, false) orelse return false;
                 map.getTile(t).object = .none;
             },
-            // Forester: plant a tree on a nearby empty grass tile — produces no
-            // resource, it just replenishes the forest for lumberjacks.
+            // Forester: plant a tree on a nearby empty grass tile. Produces no
+            // resource (it replenishes the forest for lumberjacks), so there is
+            // no output to stock.
             .forester => {
                 self.plantTreeNear(building.pos, radius);
                 return true;
@@ -281,10 +286,22 @@ pub const Game = struct {
             else => {},
         }
 
+        // Processing buildings: consume one unit of input from the building
+        // stock before producing. If the input is unavailable, stall.
+        if (getInputResource(building.building_type)) |input_res| {
+            if (building.removeStock(input_res, 1) == 0) return false;
+        }
+
+        // Deposit the output into the building's local stock. If the stock is
+        // full (all 4 slots occupied by other resources), stall so the timer
+        // retries once `updateInventories` frees space.
         if (getProducedResource(building.building_type)) |res| {
-            if (building.player < MAX_PLAYERS) {
-                const p = &self.state.players.players[building.player];
-                p.resources[@intFromEnum(res)] +|= 1;
+            if (building.addStock(res, 1) == 0) {
+                // Reclaim the consumed input so it isn't lost.
+                if (getInputResource(building.building_type)) |input_res| {
+                    _ = building.addStock(input_res, 1);
+                }
+                return false;
             }
         }
         return true;
@@ -347,8 +364,140 @@ pub const Game = struct {
     fn updatePlayers(_: *Game, _: u64) void {
     }
 
-    /// Update inventories — redistribute resources between flags and buildings.
-    fn updateInventories(_: *Game, _: u64) void {
+    /// Update inventories — move resources between buildings, flags, and the
+    /// player's stock. Three passes per tick:
+    ///
+    /// 1. **Building → flag (output export):** each producer building pushes
+    ///    one unit of each stocked output resource onto its connected flag's
+    ///    incoming queue (if space).
+    /// 2. **Flag → building (input import):** each processing building pulls
+    ///    one unit of its input resource from its connected flag's outgoing
+    ///    queue into its stock (if space).
+    /// 3. **Flag → stock (delivery):** resources sitting in a flag's outgoing
+    ///    queue are delivered to the player's stock. If the flag is attached
+    ///    to a stock building, it is absorbed directly. Otherwise a BFS over
+    ///    the road network finds a path to a stock building's flag and
+    ///    delivers there. Flags with no road connections at all deliver
+    ///    straight to the player stock (fallback so unconnected buildings
+    ///    still contribute to the economy before roads are built).
+    fn updateInventories(self: *Game, _: u64) void {
+        const flags = &self.state.flags;
+        const buildings = &self.state.buildings;
+
+        // --- Pass 1: building → flag (output export) ---
+        for (buildings.buildings.items) |*b| {
+            if (!b.is_done or b.is_burning) continue;
+            if (!b.flag_index.isValid()) continue;
+            const flag = flags.get(b.flag_index);
+            // Push up to 1 unit of each stocked resource per tick.
+            for (0..4) |si| {
+                if (b.resources[si] == 0) continue;
+                const res: u8 = b.resource_types[si];
+                if (flag.incoming_count >= @import("FlagState.zig").FlagQueueCapacity) break;
+                flag.incoming_queue[flag.incoming_count] = res;
+                flag.incoming_count += 1;
+                b.resources[si] -= 1;
+                if (b.resources[si] == 0) b.resource_types[si] = 0;
+            }
+        }
+
+        // --- Pass 2: flag → building (input import) ---
+        for (buildings.buildings.items) |*b| {
+            if (!b.is_done or b.is_burning) continue;
+            if (!b.flag_index.isValid()) continue;
+            const input_res = getInputResource(b.building_type) orelse continue;
+            const flag = flags.get(b.flag_index);
+            if (flag.outgoing_count == 0) continue;
+            // Find a matching resource in the outgoing queue.
+            const want = @intFromEnum(input_res);
+            var qi: u8 = 0;
+            while (qi < flag.outgoing_count) : (qi += 1) {
+                if (flag.outgoing_queue[qi] == want) break;
+            }
+            if (qi >= flag.outgoing_count) continue; // not present
+            if (b.addStock(input_res, 1) == 0) continue; // building stock full
+            // Remove the item from the outgoing queue (compact).
+            var j = qi;
+            while (j + 1 < flag.outgoing_count) : (j += 1) {
+                flag.outgoing_queue[j] = flag.outgoing_queue[j + 1];
+            }
+            flag.outgoing_count -= 1;
+        }
+
+        // --- Pass 3: flag → stock (delivery) ---
+        // Pre-compute which flags are attached to a stock building.
+        var flag_idx: usize = 0;
+        while (flag_idx < flags.flags.items.len) : (flag_idx += 1) {
+            const flag = &flags.flags.items[flag_idx];
+            if (flag.outgoing_count == 0) continue;
+
+            const fis_stock = blk: {
+                if (flag.building_index.isValid()) {
+                    const bld = buildings.get(flag.building_index);
+                    break :blk bld.building_type == .stock;
+                }
+                break :blk false;
+            };
+
+            const deliver_to_stock = fis_stock or self.flagReachesStock(@intCast(flag_idx));
+
+            // Drain the outgoing queue.
+            while (flag.outgoing_count > 0) {
+                const res = flag.outgoing_queue[flag.outgoing_count - 1];
+                flag.outgoing_count -= 1;
+                if (flag.player < MAX_PLAYERS) {
+                    self.state.players.players[flag.player].resources[res] +|= 1;
+                }
+                // If this flag isn't connected to a stock, only deliver one
+                // item per tick (fallback pace) so unconnected buildings
+                // don't dump their entire queue instantly.
+                if (!deliver_to_stock) break;
+            }
+        }
+    }
+
+    /// BFS over the road network (flag `next[6]` graph) to determine whether
+    /// the flag at `flag_idx` can reach a stock building's flag.
+    fn flagReachesStock(self: *Game, flag_idx: usize) bool {
+        const flags = &self.state.flags;
+        const buildings = &self.state.buildings;
+        const FlagQueueCapacity = @import("FlagState.zig").FlagQueueCapacity;
+        _ = FlagQueueCapacity;
+
+        // Visited bitmap over flag indices. Use a small stack-backed array;
+        // maps are small (≤ 1024×1024 but flag count is modest).
+        var visited_buf: [256]bool = @splat(false);
+        var queue_buf: [256]usize = @splat(0);
+        var queue_len: usize = 0;
+
+        if (flag_idx >= flags.flags.items.len) return false;
+        queue_buf[queue_len] = flag_idx;
+        queue_len += 1;
+        if (flag_idx < visited_buf.len) visited_buf[flag_idx] = true;
+
+        var head: usize = 0;
+        while (head < queue_len) : (head += 1) {
+            const cur_idx = queue_buf[head];
+            const cur = &flags.flags.items[cur_idx];
+            // Is this flag attached to a stock building?
+            if (cur.building_index.isValid()) {
+                const bld = buildings.get(cur.building_index);
+                if (bld.building_type == .stock) return true;
+            }
+            // Enqueue connected neighbours.
+            for (0..6) |d| {
+                const nxt = cur.next[d];
+                if (!nxt.isValid()) continue;
+                const ni: usize = nxt.index;
+                if (ni >= flags.flags.items.len) continue;
+                if (ni < visited_buf.len and visited_buf[ni]) continue;
+                if (queue_len >= queue_buf.len) break;
+                queue_buf[queue_len] = ni;
+                queue_len += 1;
+                if (ni < visited_buf.len) visited_buf[ni] = true;
+            }
+        }
+        return false;
     }
 
     /// Get the current game map.
@@ -576,7 +725,7 @@ pub const Game = struct {
 };
 
 test "Game init and tick" {
-    var game = try Game.init(std.testing.allocator, 32, 32, 1, .{ .seed = 42 });
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
     defer game.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), game.state.tick);
@@ -585,7 +734,7 @@ test "Game init and tick" {
 }
 
 test "Game place building" {
-    var game = try Game.init(std.testing.allocator, 32, 32, 1, .{ .seed = 42 });
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
     defer game.deinit();
 
     const pos = types.MapPos{ .x = 10, .y = 10 };
@@ -606,7 +755,7 @@ test "Game production time" {
 }
 
 test "Terrain generation scatters objects" {
-    var game = try Game.init(std.testing.allocator, 48, 48, 1, .{ .seed = 42 });
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
     defer game.deinit();
     var objects: usize = 0;
     for (game.state.map.tiles) |t| {
@@ -616,7 +765,7 @@ test "Terrain generation scatters objects" {
 }
 
 test "Cannot build on a tile with an object" {
-    var game = try Game.init(std.testing.allocator, 16, 16, 1, .{ .seed = 42 });
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
     defer game.deinit();
     const pos = types.MapPos{ .x = 8, .y = 8 };
     const tile = game.state.map.getTile(pos);
@@ -628,7 +777,7 @@ test "Cannot build on a tile with an object" {
 }
 
 test "Staffed lumberjack fells a nearby tree and yields wood" {
-    var game = try Game.init(std.testing.allocator, 16, 16, 1, .{ .seed = 42 });
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
     defer game.deinit();
     game.state.players.setPlayerCount(1);
     game.state.speed = 1;
@@ -652,7 +801,7 @@ test "Staffed lumberjack fells a nearby tree and yields wood" {
 }
 
 test "buildRoad links two flags and marks the path" {
-    var game = try Game.init(std.testing.allocator, 16, 16, 1, .{ .seed = 42 });
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
     defer game.deinit();
     const a = types.MapPos{ .x = 4, .y = 4 };
     const b = types.MapPos{ .x = 6, .y = 4 };
@@ -666,4 +815,147 @@ test "buildRoad links two flags and marks the path" {
     const path = [_]u8{ @intFromEnum(Direction.right), @intFromEnum(Direction.right) };
     try std.testing.expect(game.buildRoad(a, b, &path));
     try std.testing.expect(game.state.map.getTile(.{ .x = 5, .y = 4 }).has_road);
+}
+
+test "Processing building consumes input and produces output" {
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
+    defer game.deinit();
+    game.state.players.setPlayerCount(1);
+    game.state.speed = 1;
+
+    const pos = types.MapPos{ .x = 8, .y = 8 };
+    const tile = game.state.map.getTile(pos);
+    tile.terrain = .grass;
+    tile.object = .none;
+    const idx = (try game.placeBuilding(pos, .sawmill, 0)).?;
+    const b = game.state.buildings.get(idx);
+    b.is_done = true; // skip construction
+    // Give the sawmill some wood to consume.
+    _ = b.addStock(.wood, 3);
+    try std.testing.expectEqual(@as(u16, 3), b.stockCount(.wood));
+
+    // Run enough ticks for one production cycle (sawmill = 60 ticks) plus
+    // worker assignment.
+    var t: u64 = 1;
+    while (t <= 200) : (t += 1) game.tick(t);
+
+    // The sawmill should have consumed some wood and produced planks (which
+    // may still be in the building stock or have moved to the flag/stock).
+    const wood_consumed = b.stockCount(.wood) < 3;
+    const planks_made = b.stockCount(.planks) > 0 or
+        game.state.players.players[0].resources[@intFromEnum(Resource.planks)] > 0;
+    try std.testing.expect(wood_consumed);
+    try std.testing.expect(planks_made);
+}
+
+test "Processing building stalls without input stock" {
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
+    defer game.deinit();
+    game.state.players.setPlayerCount(1);
+    game.state.speed = 1;
+
+    const pos = types.MapPos{ .x = 8, .y = 8 };
+    const tile = game.state.map.getTile(pos);
+    tile.terrain = .grass;
+    tile.object = .none;
+    const idx = (try game.placeBuilding(pos, .sawmill, 0)).?;
+    const b = game.state.buildings.get(idx);
+    b.is_done = true;
+    // No wood in stock — sawmill must stall.
+    try std.testing.expectEqual(@as(u16, 0), b.stockCount(.wood));
+
+    var t: u64 = 1;
+    while (t <= 200) : (t += 1) game.tick(t);
+
+    // No planks produced anywhere.
+    try std.testing.expectEqual(@as(u16, 0), b.stockCount(.planks));
+    try std.testing.expectEqual(@as(u16, 0), game.state.players.players[0].resources[@intFromEnum(Resource.planks)]);
+    // production_count should not have advanced (stalled, timer pinned).
+    try std.testing.expectEqual(@as(u8, 0), b.production_count);
+}
+
+test "Building output flows to player stock via flag" {
+    // A lumberjack with a tree nearby. After enough ticks, wood should reach
+    // the player's stock (via building stock → flag → player fallback).
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
+    defer game.deinit();
+    game.state.players.setPlayerCount(1);
+    game.state.speed = 1;
+
+    const pos = types.MapPos{ .x = 8, .y = 8 };
+    const tile = game.state.map.getTile(pos);
+    tile.terrain = .grass;
+    tile.object = .none;
+    const idx = (try game.placeBuilding(pos, .lumberjack, 0)).?;
+    game.state.buildings.get(idx).is_done = true;
+
+    // Ensure a tree is always available (replant after each harvest).
+    const tree_pos = types.MapPos{ .x = 9, .y = 8 };
+    game.state.map.getTile(tree_pos).object = .tree;
+
+    var t: u64 = 1;
+    while (t <= 300) : (t += 1) {
+        game.tick(t);
+        // Replant so the lumberjack keeps producing.
+        if (game.state.map.getTile(tree_pos).object == .none) {
+            game.state.map.getTile(tree_pos).object = .tree;
+        }
+    }
+
+    const wood_in_stock = game.state.players.players[0].resources[@intFromEnum(Resource.wood)];
+    try std.testing.expect(wood_in_stock > 0);
+}
+
+test "Road-connected building delivers to stock building" {
+    // Lumberjack's flag → road → stock building's flag. Resources should
+    // reach the player stock via the road network (not just the fallback).
+    var game = try Game.init(std.testing.allocator, 64, 64, 1, .{ .seed = 42 });
+    defer game.deinit();
+    game.state.players.setPlayerCount(1);
+    game.state.speed = 1;
+
+    // Layout (all grass, no objects):
+    //   (4,4) stock flag   (5,4) road   (6,4) lumberjack flag
+    //   (4,5) stock bldg                (6,5) lumberjack bldg
+    const stock_pos = types.MapPos{ .x = 4, .y = 5 };
+    const lj_pos = types.MapPos{ .x = 6, .y = 5 };
+    for ([_]types.MapPos{ stock_pos, lj_pos, .{ .x = 4, .y = 4 }, .{ .x = 5, .y = 4 }, .{ .x = 6, .y = 4 } }) |p| {
+        const tl = game.state.map.getTile(p);
+        tl.terrain = .grass;
+        tl.object = .none;
+    }
+
+    // Place the stock building (auto-creates a flag at (4,4) = down_right).
+    const stock_idx = (try game.placeBuilding(stock_pos, .stock, 0)).?;
+    const stock_flag = game.state.buildings.get(stock_idx).flag_index;
+
+    // Place the lumberjack (auto-creates a flag at (6,4)).
+    const lj_idx = (try game.placeBuilding(lj_pos, .lumberjack, 0)).?;
+    const lj_flag = game.state.buildings.get(lj_idx).flag_index;
+    game.state.buildings.get(lj_idx).is_done = true;
+
+    // Build a road between the two flags: (4,4)→(5,4)→(6,4) = right, right.
+    const path = [_]u8{ @intFromEnum(Direction.right), @intFromEnum(Direction.right) };
+    try std.testing.expect(game.buildRoad(
+        game.state.flags.get(stock_flag).pos,
+        game.state.flags.get(lj_flag).pos,
+        &path,
+    ));
+
+    // Verify the BFS finds the stock from the lumberjack's flag.
+    try std.testing.expect(game.flagReachesStock(lj_flag.index));
+
+    // Keep a tree available for the lumberjack.
+    const tree_pos = types.MapPos{ .x = 7, .y = 5 };
+    game.state.map.getTile(tree_pos).object = .tree;
+
+    var t: u64 = 1;
+    while (t <= 300) : (t += 1) {
+        game.tick(t);
+        if (game.state.map.getTile(tree_pos).object == .none) {
+            game.state.map.getTile(tree_pos).object = .tree;
+        }
+    }
+
+    try std.testing.expect(game.state.players.players[0].resources[@intFromEnum(Resource.wood)] > 0);
 }
