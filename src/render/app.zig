@@ -666,16 +666,21 @@ pub const App = struct {
         const w: usize = @intCast(@max(fb.width, 1));
         const h: usize = @intCast(@max(fb.height, 1));
 
-        // Read the framebuffer as GL_RGB (3 bytes/pixel, top row first).
+        // Read the framebuffer as GL_BGR (blue, green, red) — this is the exact
+        // byte order a 24-bit BMP stores, so no per-pixel channel swap is
+        // needed. OpenGL's framebuffer origin is the BOTTOM-left, so the first
+        // row returned is the bottom row of the screen — which is also what a
+        // bottom-up BMP wants, so no vertical flip is needed either.
         const row_bytes = w * 3;
         const buf_size = row_bytes * h;
-        const rgb = try self.allocator.alloc(u8, buf_size);
-        defer self.allocator.free(rgb);
+        const bgr = try self.allocator.alloc(u8, buf_size);
+        defer self.allocator.free(bgr);
 
-        gl.readPixels(0, 0, fb.width, fb.height, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, rgb);
+        gl.readPixels(0, 0, fb.width, fb.height, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, bgr);
 
         // Build the BMP file in memory. 24-bit, bottom-up rows, each row
-        // padded to a 4-byte boundary.
+        // padded to a 4-byte boundary. The pixel data is already in BGR
+        // bottom-up order from glReadPixels, so we copy it forward as-is.
         const row_stride = (row_bytes + 3) & ~@as(usize, 3);
         const pixel_data_size = row_stride * h;
         const file_size = 14 + 40 + pixel_data_size;
@@ -707,13 +712,13 @@ pub const App = struct {
         std.mem.writeInt(u32, bmp[p + 36..][0..4], 0, .little); // important colors
         p += 40;
 
-        // Pixel data: BMP rows are bottom-up, glReadPixels returns top-down, so
-        // write rows from last to first. Pad each row to a 4-byte boundary.
+        // Pixel data: already in BGR bottom-up order from glReadPixels, so
+        // copy rows forward (first read row = bottom of screen = first BMP
+        // row). Pad each row to a 4-byte boundary.
         const pad = row_stride - row_bytes;
-        var y: usize = h;
-        while (y > 0) {
-            y -= 1;
-            const src = rgb[y * row_bytes ..][0..row_bytes];
+        var y: usize = 0;
+        while (y < h) : (y += 1) {
+            const src = bgr[y * row_bytes ..][0..row_bytes];
             @memcpy(bmp[p..][0..row_bytes], src);
             p += row_bytes;
             if (pad > 0) {
