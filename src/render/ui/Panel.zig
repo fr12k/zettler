@@ -265,17 +265,19 @@ pub const Panel = struct {
 
         // ── Resource count text (text-only, no colored chips) ──
         // Format: "Wood: 20" with full resource name + count.
-        // Font scale 2.0 for readability (4×6 bitmap → 8×12 on screen).
+        // Font scale 1.5 for readability (4×6 bitmap → 6×9 on screen).
+        // Spacing 112px fits all 9 resources in a 1024px-wide window
+        // with room for 3-digit counts (e.g. "Planks: 999" = 99px).
         const player = &game.state.players.players[0];
         var rx: f32 = 8.0;
-        const ry: f32 = 6.0; // vertically centered in 36px bar
-        const text_scale: f32 = 2.0;
-        const col_w: f32 = 110.0; // spacing per resource entry
+        const ry: f32 = 9.0; // vertically centered in 36px bar
+        const text_scale: f32 = 1.5;
+        const col_w: f32 = 112.0; // spacing per resource entry
         for (hud_resources) |res| {
             const val = player.resources[@intFromEnum(res)];
             font.drawFmt(batcher, "{s}: {}", .{ res.name(), val }, rx, ry, .{ 1, 1, 1, 1 }, text_scale);
             rx += col_w;
-            if (rx > sw - 100) break;
+            if (rx > sw - 50) break;
         }
 
         // ── Tooltip text ──
