@@ -91,7 +91,7 @@ test "GameState creation" {
 }
 
 test "GameState tick" {
-    var gs = try GameState.init(std.testing.allocator, 32, 32);
+    var gs = try GameState.init(std.testing.allocator, 64, 64);
     defer gs.deinit();
 
     gs.tickOnce();
@@ -102,7 +102,7 @@ test "GameState tick" {
 }
 
 test "GameState pause" {
-    var gs = try GameState.init(std.testing.allocator, 32, 32);
+    var gs = try GameState.init(std.testing.allocator, 64, 64);
     defer gs.deinit();
 
     gs.is_paused = true;

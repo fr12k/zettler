@@ -406,7 +406,7 @@ These modules extract assets from the original Settlers DOS data files (`SPAE.PA
 
 | # | Task | Files | Est. LOC | Notes |
 |---|---|---|---|---|
-| 2p.1 | **Building resource consumption** | `src/core/Building.zig` (+edit) | 150 | updateProduction() checks inventory, consumes input, produces output |
+| 2p.1 | **Building resource consumption** | `src/core/BuildingState.zig`, `src/core/Game.zig` | 150 | ✅ Done — buildings consume input from local stock, produce output into local stock; `updateInventories` moves resources building↔flag→player stock via road-network BFS |
 | 2p.2 | **Player resource management** | `src/core/Player.zig` (+edit) | 200 | updatePlayers() distributes resources, handles stock |
 | 2p.3 | **Flag road network BFS** | `src/core/Flag.zig` (+edit) | 250 | Connect flags via roads, find nearest resource along road graph |
 | 2p.4 | **Serf assignment to buildings** | `src/core/Serf.zig` (+edit) | 300 | idle_in_stock → find unstaffed building → assign serf |
@@ -424,6 +424,46 @@ These modules extract assets from the original Settlers DOS data files (`SPAE.PA
 - ✅ Build roads between flags
 - ✅ See serfs walk roads and deliver resources
 - ✅ See production chains produce resources
+
+#### How to run the game
+
+```bash
+# Build (requires Zig 0.17-dev, system GLFW + OpenGL)
+zig build
+
+# Run the full GLFW/OpenGL game (needs a display)
+zig build run
+
+# Run with a fixed seed for reproducible terrain
+zig build run -- --seed 42
+
+# Run with a larger map (default 64×64, max 1024×1024)
+zig build run -- --map-size 256 256
+
+# Save/load a map
+zig build run -- --seed 42 --save-map world.zmap
+zig build run -- --map-file world.zmap
+
+# Headless terminal demo (no display needed — prints resource stats)
+# This runs automatically when GLFW can't init (e.g. over SSH)
+zig build run -- --seed 42
+
+# Run tests
+zig build test
+
+# Show all CLI options
+zig build run -- --help
+```
+
+**Prerequisites:** Install GLFW3 (`brew install glfw` on macOS,
+`apt install libglfw3-dev` on Debian/Ubuntu).
+
+**What you'll see:** The game opens a window showing the isometric hex map
+with 9 pre-placed demo buildings (lumberjack, fisher, stock, sawmill,
+forester, farm, tower, stonecutter, mill) around the map center. The top
+bar shows resource counts (Wood:20, Planks:15, Stone:10, Fish:8, ...) —
+these increase over time as buildings produce and deliver resources
+through the flag/road network to the stock building.
 
 #### Controls Reference (current build)
 

@@ -77,6 +77,7 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{
         .root_module = core_mod,
     });
+    core_tests.root_module.link_libc = true;
     const run_core_tests = b.addRunArtifact(core_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_core_tests.step);

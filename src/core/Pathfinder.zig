@@ -107,7 +107,7 @@ pub const Pathfinder = struct {
         self.closed_set.clearRetainingCapacity();
 
         const h_start = self.heuristic(from, to);
-        try self.open_list.append(.{ .pos = from, .g = 0, .h = h_start, .parent = null });
+        try self.open_list.append(self.allocator, .{ .pos = from, .g = 0, .h = h_start, .parent = null });
 
         const max_iterations = 5000;
         var iteration: u32 = 0;
@@ -188,7 +188,7 @@ pub const Pathfinder = struct {
                     if (cost >= 1000) continue; // impassable
                     const g = current.g + cost;
                     const h = self.heuristic(npos, to);
-                    try self.open_list.append(.{
+                    try self.open_list.append(self.allocator, .{
                         .pos = npos,
                         .g = g,
                         .h = h,
@@ -207,10 +207,10 @@ pub const Pathfinder = struct {
         var visited = std.AutoHashMap(MapPos, void).init(self.allocator);
         defer visited.deinit();
         
-        var queue = std.ArrayList(MapPos).init(self.allocator);
-        defer queue.deinit();
-        
-        queue.append(from) catch return false;
+        var queue: std.ArrayList(MapPos) = .empty;
+        defer queue.deinit(self.allocator);
+
+        queue.append(self.allocator, from) catch return false;
         visited.put(from, {}) catch return false;
 
         const max_steps: usize = 2000;
@@ -233,7 +233,7 @@ pub const Pathfinder = struct {
                 if (!self.map.getTile(npos).terrain.isWalkable()) continue;
                 
                 visited.put(npos, {}) catch return false;
-                queue.append(npos) catch return false;
+                queue.append(self.allocator, npos) catch return false;
             }
         }
 

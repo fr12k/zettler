@@ -41,6 +41,38 @@ pub const PlayerActionResult = enum(u8) {
 
 /// Player manager — provides functions for per-player logic.
 pub const PlayerManager = struct {
+    const ConstructionCost = struct { wood: u16, stone: u16, planks: u16 };
+
+    fn constructionCost(building_type: Building) ConstructionCost {
+        return switch (building_type) {
+            .stonecutter => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .lumberjack => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .boatbuilder => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .sawmill => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .forester => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .stock => .{ .wood = 3, .stone = 2, .planks = 3 },
+            .granite_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .coal_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .iron_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .gold_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .iron_smelter => .{ .wood = 2, .stone = 1, .planks = 2 },
+            .gold_smelter => .{ .wood = 2, .stone = 1, .planks = 2 },
+            .armory => .{ .wood = 2, .stone = 1, .planks = 2 },
+            .toolmaker => .{ .wood = 2, .stone = 1, .planks = 2 },
+            .bakery => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .mill => .{ .wood = 2, .stone = 1, .planks = 2 },
+            .slaughterhouse => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .pig_farm => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .brewery => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .winery => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .farm => .{ .wood = 2, .stone = 0, .planks = 2 },
+            .fisher => .{ .wood = 1, .stone = 0, .planks = 1 },
+            .tower => .{ .wood = 2, .stone = 2, .planks = 2 },
+            .fortress => .{ .wood = 4, .stone = 4, .planks = 4 },
+            .none => .{ .wood = 0, .stone = 0, .planks = 0 },
+        };
+    }
+
     /// Update a player for one game tick.
     pub fn update(_player: *PlayerState, _state: *GameState, _player_index: u8, _tick: u64) PlayerActionResult {
         // Future: resource balancing, AI decisions
@@ -53,33 +85,7 @@ pub const PlayerManager = struct {
 
     /// Check if a player has enough resources to construct a building.
     pub fn canAfford(player: *PlayerState, building_type: Building) bool {
-        const cost = switch (building_type) {
-            .stonecutter => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .lumberjack => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .boatbuilder => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .sawmill => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .forester => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .stock => .{ .wood = 3, .stone = 2, .planks = 3 },
-            .granite_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .coal_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .iron_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .gold_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .iron_smelter => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .gold_smelter => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .armory => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .toolmaker => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .bakery => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .mill => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .slaughterhouse => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .pig_farm => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .brewery => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .winery => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .farm => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .fisher => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .tower => .{ .wood = 2, .stone = 2, .planks = 2 },
-            .fortress => .{ .wood = 4, .stone = 4, .planks = 4 },
-            .none => .{ .wood = 0, .stone = 0, .planks = 0 },
-        };
+        const cost = constructionCost(building_type);
         return player.resources[@intFromEnum(Resource.wood)] >= cost.wood and
             player.resources[@intFromEnum(Resource.stone)] >= cost.stone and
             player.resources[@intFromEnum(Resource.planks)] >= cost.planks;
@@ -87,33 +93,7 @@ pub const PlayerManager = struct {
 
     /// Deduct construction cost from player's resources.
     pub fn payFor(player: *PlayerState, building_type: Building) void {
-        const cost = switch (building_type) {
-            .stonecutter => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .lumberjack => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .boatbuilder => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .sawmill => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .forester => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .stock => .{ .wood = 3, .stone = 2, .planks = 3 },
-            .granite_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .coal_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .iron_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .gold_mine => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .iron_smelter => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .gold_smelter => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .armory => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .toolmaker => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .bakery => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .mill => .{ .wood = 2, .stone = 1, .planks = 2 },
-            .slaughterhouse => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .pig_farm => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .brewery => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .winery => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .farm => .{ .wood = 2, .stone = 0, .planks = 2 },
-            .fisher => .{ .wood = 1, .stone = 0, .planks = 1 },
-            .tower => .{ .wood = 2, .stone = 2, .planks = 2 },
-            .fortress => .{ .wood = 4, .stone = 4, .planks = 4 },
-            .none => .{ .wood = 0, .stone = 0, .planks = 0 },
-        };
+        const cost = constructionCost(building_type);
         player.resources[@intFromEnum(Resource.wood)] -= cost.wood;
         player.resources[@intFromEnum(Resource.stone)] -= cost.stone;
         player.resources[@intFromEnum(Resource.planks)] -= cost.planks;

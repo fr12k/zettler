@@ -98,7 +98,7 @@ pub fn buildingName(b: Building) []const u8 {
 }
 
 /// HUD top bar height in pixels.
-pub const TOP_BAR_H: f32 = 28.0;
+pub const TOP_BAR_H: f32 = 36.0;
 /// HUD left panel width in pixels.
 pub const LEFT_PANEL_W: f32 = 180.0;
 /// Building menu icon size.
@@ -195,51 +195,29 @@ pub const Panel = struct {
         self.selected_building = .none;
     }
 
-    /// Draw the HUD overlay.
-    pub fn draw(self: *Panel, batcher: *SpriteBatcher, font: *Font, game: *Game) void {
+    /// Draw the HUD overlay — background only (semi-transparent top bar).
+    /// No colored chips — the resource display is text-only.
+    /// These use the fallback white 1x1 texture and must be flushed before
+    /// `drawText` (which uses the font atlas texture).
+    pub fn drawBackground(self: *Panel, batcher: *SpriteBatcher, font: *Font, game: *Game) void {
+        _ = game; // game state is only needed for text (resource counts)
         if (!self.visible) return;
 
         const sw = self.screen_w;
 
-        // ── Top bar background ──
+        // ── Top bar background (semi-transparent black) ──
         batcher.add(.{
             .x = 0, .y = 0,
             .width = sw, .height = TOP_BAR_H,
             .u = 0, .v = 0, .uw = 0, .vh = 0,
-            .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.5,
+            .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.6,
         });
-
-        // ── Resource counts ──
-        const player = &game.state.players.players[0];
-        var rx: f32 = 8.0;
-        const ry: f32 = 2.0;
-        for (hud_resources) |res| {
-            const val = player.resources[@intFromEnum(res)];
-            const c = ResourceColors.get(res);
-
-            // Colour chip
-            batcher.add(.{
-                .x = rx, .y = ry + 2,
-                .width = 8, .height = TOP_BAR_H - 8,
-                .u = 0, .v = 0, .uw = 0, .vh = 0,
-                .r = c[0], .g = c[1], .b = c[2], .a = 0.9,
-            });
-
-            // Resource name (short)
-            const short = res.name();
-            const short3 = if (short.len > 4) short[0..4] else short;
-            font.drawFmt(batcher, "{s}:{}", .{ short3, val }, rx + 10, ry + 2, .{ 1, 1, 1, 1 }, 0.7);
-
-            rx += 72.0;
-            if (rx > sw - 80) break;
-        }
 
         // ── Building menu grid ──
         // Cell backgrounds + selection highlight here (white-texture batch);
         // the building-sprite icon itself is drawn by app.zig over the top with
         // the atlas texture bound. Hover tooltips are drawn last so they sit on
         // top of neighbouring cells.
-        const menu_y = TOP_BAR_H + PAD;
         for (&self.menu_regions, 0..) |region, i| {
             const bx = region.rect.x;
             const by = region.rect.y;
@@ -272,6 +250,41 @@ pub const Panel = struct {
                     .u = 0, .v = 0, .uw = 0, .vh = 0,
                     .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.8,
                 });
+            }
+        }
+    }
+
+    /// Draw the HUD overlay — text only (resource counts, tooltip text,
+    /// building info, tool mode indicator). Must be called after
+    /// `drawBackground` and flushed with the font atlas texture bound.
+    pub fn drawText(self: *Panel, batcher: *SpriteBatcher, font: *Font, game: *Game) void {
+        if (!self.visible) return;
+
+        const sw = self.screen_w;
+        const menu_y = TOP_BAR_H + PAD;
+
+        // ── Resource count text (text-only, no colored chips) ──
+        // Format: "Wood: 20" with full resource name + count.
+        // Font scale 1.5 for readability (4×6 bitmap → 6×9 on screen).
+        // Spacing 112px fits all 9 resources in a 1024px-wide window
+        // with room for 3-digit counts (e.g. "Planks: 999" = 99px).
+        const player = &game.state.players.players[0];
+        var rx: f32 = 8.0;
+        const ry: f32 = 9.0; // vertically centered in 36px bar
+        const text_scale: f32 = 1.5;
+        const col_w: f32 = 112.0; // spacing per resource entry
+        for (hud_resources) |res| {
+            const val = player.resources[@intFromEnum(res)];
+            font.drawFmt(batcher, "{s}: {}", .{ res.name(), val }, rx, ry, .{ 1, 1, 1, 1 }, text_scale);
+            rx += col_w;
+            if (rx > sw - 50) break;
+        }
+
+        // ── Tooltip text ──
+        for (&self.menu_regions) |region| {
+            if (region.contains(self.mouse_x, self.mouse_y)) {
+                const bx = region.rect.x;
+                const by = region.rect.y;
                 font.drawText(batcher, region.tooltip, bx + 4, by - 13, .{ 1, 1, 1, 1 }, 0.6);
             }
         }
@@ -304,13 +317,15 @@ pub const Panel = struct {
         if (self.tool_mode == .place_building and self.selected_building != .none) {
             const mode_text = std.fmt.allocPrint(std.heap.page_allocator, "Building: {s} — Click map to place (Right-click cancel)", .{buildingName(self.selected_building)}) catch "";
             defer if (mode_text.len > 0) std.heap.page_allocator.free(mode_text);
-            // Draw centered at bottom of screen
             const tw = font.textWidth(mode_text, 0.6);
             font.drawText(batcher, mode_text, (sw - tw) / 2.0, self.screen_h - 16, .{ 1, 1, 0.6, 0.9 }, 0.6);
         }
 
-        // ── FPS counter (top right) ──
-        // FPS is drawn by app.zig directly
+        // ── Road building mode indicator ──
+        if (self.tool_mode == .build_road) {
+            const tw = font.textWidth("Road mode: click two flags (Right-click cancel)", 0.6);
+            font.drawText(batcher, "Road mode: click two flags (Right-click cancel)", (sw - tw) / 2.0, self.screen_h - 16, .{ 1, 1, 0.6, 0.9 }, 0.6);
+        }
     }
 };
 

@@ -31,3 +31,26 @@ pub const Vec2i = types.Vec2i;
 pub const Vec2f = types.Vec2f;
 pub const Mat4 = types.Mat4;
 pub const Rect = types.Rect;
+
+// Force the compiler to analyze every imported module so that the test runner
+// discovers the `test` blocks defined in each file. Without this, `pub const`
+// re-exports are lazy and the tests are never collected.
+comptime {
+    _ = enums;
+    _ = types;
+    _ = map;
+    _ = game_state;
+    _ = player_state;
+    _ = building_state;
+    _ = flag_state;
+    _ = serf_state;
+    _ = random;
+    _ = inventory;
+    _ = pathfinder;
+    _ = serf;
+    _ = building;
+    _ = player;
+    _ = flag;
+    _ = game;
+    _ = noise;
+}

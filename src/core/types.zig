@@ -186,7 +186,7 @@ test "MapPos movement" {
 }
 
 test "Mat4 ortho" {
-    const m = Mat4.ortho(0, 800, 600, 0, -1, 1);
+    const m = Mat4.ortho(0, 800, 0, 600, -1, 1);
     try std.testing.expectApproxEqAbs(2.0 / 800.0, m.data[0], 0.001);
     try std.testing.expectApproxEqAbs(2.0 / 600.0, m.data[5], 0.001);
 }
@@ -203,5 +203,5 @@ test "GameObjectIndex invalid" {
 }
 
 test "Resource names" {
-    try std.testing.expectEqualStrings("Fish", @tagName(enums.Resource.fish));
+    try std.testing.expectEqualStrings("Fish", enums.Resource.fish.name());
 }
