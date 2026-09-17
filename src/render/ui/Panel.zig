@@ -98,7 +98,7 @@ pub fn buildingName(b: Building) []const u8 {
 }
 
 /// HUD top bar height in pixels.
-pub const TOP_BAR_H: f32 = 28.0;
+pub const TOP_BAR_H: f32 = 36.0;
 /// HUD left panel width in pixels.
 pub const LEFT_PANEL_W: f32 = 180.0;
 /// Building menu icon size.
@@ -195,8 +195,8 @@ pub const Panel = struct {
         self.selected_building = .none;
     }
 
-    /// Draw the HUD overlay — colored quads only (background, resource
-    /// chips, menu cell backgrounds, tooltip backgrounds).
+    /// Draw the HUD overlay — background only (semi-transparent top bar).
+    /// No colored chips — the resource display is text-only.
     /// These use the fallback white 1x1 texture and must be flushed before
     /// `drawText` (which uses the font atlas texture).
     pub fn drawBackground(self: *Panel, batcher: *SpriteBatcher, font: *Font, game: *Game) void {
@@ -205,31 +205,13 @@ pub const Panel = struct {
 
         const sw = self.screen_w;
 
-        // ── Top bar background ──
+        // ── Top bar background (semi-transparent black) ──
         batcher.add(.{
             .x = 0, .y = 0,
             .width = sw, .height = TOP_BAR_H,
             .u = 0, .v = 0, .uw = 0, .vh = 0,
-            .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.5,
+            .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.6,
         });
-
-        // ── Resource colour chips ──
-        var rx: f32 = 8.0;
-        const ry: f32 = 2.0;
-        for (hud_resources) |res| {
-            const c = ResourceColors.get(res);
-
-            // Colour chip
-            batcher.add(.{
-                .x = rx, .y = ry + 2,
-                .width = 8, .height = TOP_BAR_H - 8,
-                .u = 0, .v = 0, .uw = 0, .vh = 0,
-                .r = c[0], .g = c[1], .b = c[2], .a = 0.9,
-            });
-
-            rx += 72.0;
-            if (rx > sw - 80) break;
-        }
 
         // ── Building menu grid ──
         // Cell backgrounds + selection highlight here (white-texture batch);
@@ -281,17 +263,19 @@ pub const Panel = struct {
         const sw = self.screen_w;
         const menu_y = TOP_BAR_H + PAD;
 
-        // ── Resource count text ──
+        // ── Resource count text (text-only, no colored chips) ──
+        // Format: "Wood: 20" with full resource name + count.
+        // Font scale 2.0 for readability (4×6 bitmap → 8×12 on screen).
         const player = &game.state.players.players[0];
         var rx: f32 = 8.0;
-        const ry: f32 = 2.0;
+        const ry: f32 = 6.0; // vertically centered in 36px bar
+        const text_scale: f32 = 2.0;
+        const col_w: f32 = 110.0; // spacing per resource entry
         for (hud_resources) |res| {
             const val = player.resources[@intFromEnum(res)];
-            const short = res.name();
-            const short3 = if (short.len > 4) short[0..4] else short;
-            font.drawFmt(batcher, "{s}:{}", .{ short3, val }, rx + 10, ry + 2, .{ 1, 1, 1, 1 }, 0.7);
-            rx += 72.0;
-            if (rx > sw - 80) break;
+            font.drawFmt(batcher, "{s}: {}", .{ res.name(), val }, rx, ry, .{ 1, 1, 1, 1 }, text_scale);
+            rx += col_w;
+            if (rx > sw - 100) break;
         }
 
         // ── Tooltip text ──
