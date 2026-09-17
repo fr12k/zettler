@@ -1245,9 +1245,21 @@ pub const App = struct {
         self.panel.mouse_y = @floatCast(self.mouse_y);
 
         // ── Panel HUD (top bar + building menu + resource counts) ──
+        // Pass 1: colored quads (background, resource chips, menu cells) —
+        // rendered with the fallback white texture.
         batcher.begin();
-        self.panel.draw(batcher, &self.font, &self.game);
+        self.panel.drawBackground(batcher, &self.font, &self.game);
         self.flushUI(&ortho);
+
+        // Pass 2: text (resource counts, tooltips, building info) —
+        // rendered with the font atlas texture so glyphs are visible.
+        batcher.begin();
+        self.panel.drawText(batcher, &self.font, &self.game);
+        if (batcher.sprite_count > 0) {
+            self.flushUITex(&ortho, self.font.gl_texture);
+        } else {
+            batcher.sprite_count = 0; // nothing to flush
+        }
 
         // ── Build-menu icons (actual building sprites, atlas texture) ──
         if (self.panel.visible and self.atlas_loaded and self.atlas.uploaded) {
@@ -1288,13 +1300,15 @@ pub const App = struct {
             }
         }
 
-        // ── FPS counter ──
+        // ── FPS counter ── (font texture)
         batcher.begin();
         if (self.frame_count > 0) {
             self.font.drawFmt(batcher, "FPS: {d:.0}", .{self.fps}, self.view_w - 90, 2, .{ 0.7, 0.9, 1.0, 0.9 }, 0.6);
             self.font.drawFmt(batcher, "Tick: {}", .{self.game.state.tick}, self.view_w - 180, 2, .{ 0.7, 0.7, 0.7, 0.7 }, 0.6);
         }
-        self.flushUI(&ortho);
+        if (batcher.sprite_count > 0) {
+            self.flushUITex(&ortho, self.font.gl_texture);
+        }
     }
 
     pub fn close(self: *App) void {
