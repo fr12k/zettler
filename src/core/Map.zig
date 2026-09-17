@@ -183,12 +183,14 @@ pub const Map = struct {
         @memcpy(c_path[0..path.len], path);
         c_path[path.len] = 0;
 
-        // O_WRONLY | O_CREAT | O_TRUNC
+        // O_WRONLY | O_CREAT | O_TRUNC — mode 0o664 (rw-r--r--).
+        // The mode argument is required by POSIX when O_CREAT is passed;
+        // omitting it works by accident on Linux but fails on macOS.
         const fd = @as(c_int, @intCast(std.c.open(@ptrCast(c_path.ptr), .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
             .TRUNC = true,
-        })));
+        }, @as(std.c.mode_t, 0o664))));
         if (fd < 0) return error.SaveFailed;
         defer _ = std.c.close(fd);
 
@@ -754,7 +756,7 @@ test "Map load rejects bad magic" {
             .ACCMODE = .WRONLY,
             .CREAT = true,
             .TRUNC = true,
-        })));
+        }, @as(std.c.mode_t, 0o664))));
         try std.testing.expect(fd >= 0);
         defer _ = std.c.close(fd);
         var hdr: [28]u8 = undefined;
