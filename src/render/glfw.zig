@@ -32,6 +32,8 @@ pub const GLFW_KEY_F7: c_int = 296;
 pub const GLFW_KEY_F8: c_int = 297;
 pub const GLFW_KEY_F9: c_int = 298;
 pub const GLFW_KEY_F10: c_int = 299;
+pub const GLFW_KEY_F11: c_int = 300;
+pub const GLFW_KEY_F12: c_int = 301;
 
 pub const GLFW_PRESS: c_int = 1;
 pub const GLFW_RELEASE: c_int = 0;
