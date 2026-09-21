@@ -153,26 +153,54 @@ This mirrors the terrain renderer: static VBO (one period) drawn at up to
    tiles, so both endpoints of each segment must be translated by the
    same offset. Waves are independent sprites per tile.
 
-### LOD / quality reduction when zoomed out (optional, phase 2)
+### LOD / quality reduction when zoomed out — measured, not worth it
 
-The primary goal is *correctness*: render the visible part of the map at
-every zoom level. Once correct, we can reduce render cost when zoomed
-out, since each tile is only a few pixels:
+Phase 2 was implemented and **measured with per-frame timing** (`--perf
+--perf-frames N`), then **removed** because it saves only ~1ms at the
+minimum zoom (0.25) while adding complexity. The LOD thresholds (objects
+0.12, waves 0.40) meant the object skip never fired (the camera's min zoom
+floor is 0.25, above 0.12), and the wave skip saved ~1ms.
 
-- **Sprite LOD skip**: when `camera.zoom` is below a threshold (e.g.
-  0.5), skip sprites whose on-screen size would be < 1 px (trees/rocks
-  become invisible anyway). This is a cheap early-out in the tile loop.
-- **Wave skip**: waves are animated 48×19 sprites; at very low zoom they
-  are noise. Skip the wave pass entirely when `zoom < 0.4`.
-- **Road line width**: scale line width with zoom so roads remain
-  visible (currently fixed 4 px world-space → sub-pixel at low zoom).
-  Use `max(1, 4*zoom)` screen-space width.
-- **Minimap-style aggregation** (future): at extreme zoom-out, draw the
-  map as a coloured downsampled texture instead of per-tile sprites.
-  This is a larger change and out of scope for this PR.
+**Per-pass timing at zoom 0.25, 512×512 map (9 offset copies):**
 
-Phase 2 items are guarded by `camera.zoom` thresholds and do not change
-the correctness of phase 1.
+| pass          | time   | share |
+|---------------|--------|-------|
+| terrain       | 20.6ms | 47%   |
+| objects (trees/rocks) | 14.3ms | 32% |
+| waves         | 0.9ms  | 2%    |
+| roads         | 0.9ms  | 2%    |
+| buildings     | 0.03ms | <1%   |
+| ui            | 0.1ms  | <1%   |
+| **total**     | **44.2ms (23 FPS)** | |
+
+At zoom 1.0 (1 offset) the same map runs at 14.8ms (68 FPS) — the 9×
+offset loop is the cost multiplier when zoomed out.
+
+### Better approach: static object VBO (future PR)
+
+The real bottleneck is `renderMapObjects` (14.3ms): per-frame tile
+iteration + collection + sort + batcher submission for trees/rocks across
+9 offset copies. Trees and rocks **do not change position** unless
+harvested, so they can be baked into a static VBO (like the terrain
+renderer already does) and drawn at the 9 offsets without per-frame CPU
+work. Buildings are already negligible (0.03ms) because there are only a
+handful, but the same approach applies to them.
+
+Planned optimization (separate PR, out of scope for this correctness fix):
+
+- **Static object VBO**: build a VBO of all tree/rock sprites once at map
+  load / atlas build, rebuild only when a tile's object changes (harvest).
+  Draw at the 9 offsets like the terrain. Eliminates the 14.3ms per-frame
+  iteration + sort.
+- **Terrain overlay culling**: the terrain overlay pass (boundary tiles)
+  currently draws the full overlay at every offset. Cull it per-offset
+  like the base pass to cut the 20.6ms terrain cost.
+- **Roads/waves**: roads are cheap (0.9ms) and change when the player
+  builds them; waves are animated so can't be fully static, but could be
+  a static VBO rebuilt per animation frame (16 frames × 9 offsets).
+
+These are performance improvements and do not change the correctness of
+the offset-loop fix.
 
 ## Implementation phases
 
@@ -207,11 +235,14 @@ Files touched:
   - Optionally refactor the 9-offset culling to call the shared
     `culling.activeOffsets` so the two paths cannot drift.
 
-### Phase 2 — Quality/perf: LOD when zoomed out
+### Phase 2 — Quality/perf: LOD when zoomed out (MEASURED, REMOVED)
 
-- `src/render/app.zig`: add zoom thresholds to skip sub-pixel sprites,
-  waves, and scale road line width.
-- New tests for the skip thresholds (pure functions, no GL).
+Phase 2 was implemented (zoom thresholds to skip sub-pixel sprites/waves),
+measured with `--perf`, and **removed** because it saved only ~1ms at the
+minimum zoom while adding complexity. See the "LOD — measured, not worth
+it" section above for the full timing data. The real bottleneck is the
+per-frame object iteration (14.3ms), not sprite size — a static-VBO
+approach (future PR) is the right fix.
 
 ### Phase 3 — Tests & screenshots
 

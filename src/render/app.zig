@@ -69,52 +69,19 @@ pub const AppOptions = struct {
     /// captures at a specific zoom level (e.g. 0.25 to test zoomed-out
     /// rendering of objects across repeated map copies).
     initial_zoom: f32 = 2.0,
+    /// When true, the render loop records per-frame render time (ms) and
+    /// prints a summary (min/avg/p95/max/FPS) at exit. Used to measure whether
+    /// LOD skipping (Phase 2) is needed on top of the offset-loop fix.
+    perf_log: bool = false,
+    /// When perf_log is true and this is non-zero, exit after this many frames
+    /// (headless perf run). 0 = run until window close.
+    perf_frames: u64 = 0,
 };
 
 /// A 1x1 white fallback texture for when the real atlas isn't loaded.
 /// The shader multiplies colors by texture2D, so we need a white texture
 /// for colored quads to appear (otherwise texture2D returns black).
 var fallback_tex: gl.GLuint = 0;
-
-/// LOD (level-of-detail) thresholds for zoomed-out rendering. When the camera
-/// is zoomed out far enough that individual sprites become near-invisible, we
-/// skip them to keep the frame rate reasonable. These are screen-space size
-/// thresholds — a tree sprite is ~48px tall, so at zoom 0.5 it is ~24px (kept),
-/// at zoom 0.25 it is ~12px (kept, still visible), below ~0.1 it would be <5px
-/// (skipped). Waves are 19px and animated noise; skip them earlier.
-const LOD_SKIP_OBJECTS_ZOOM: f32 = 0.12; // skip trees/rocks below this zoom
-const LOD_SKIP_WAVES_ZOOM: f32 = 0.40; // skip wave animation below this zoom
-
-/// Returns true when map objects (trees/rocks) should be skipped at the given
-/// zoom. Pure function so it can be unit-tested without a GL context.
-pub fn lodSkipObjects(zoom: f32) bool {
-    return zoom < LOD_SKIP_OBJECTS_ZOOM;
-}
-
-/// Returns true when wave animation should be skipped at the given zoom.
-/// Pure function so it can be unit-tested without a GL context.
-pub fn lodSkipWaves(zoom: f32) bool {
-    return zoom < LOD_SKIP_WAVES_ZOOM;
-}
-
-test "lodSkipObjects keeps sprites at normal zoom, skips at extreme zoom-out" {
-    // Normal/zoomed-in: never skip.
-    try std.testing.expect(!lodSkipObjects(1.0));
-    try std.testing.expect(!lodSkipObjects(0.5));
-    try std.testing.expect(!lodSkipObjects(0.25)); // min zoom floor: still kept
-    // Extreme zoom-out (below the floor would be skipped, but the camera clamps
-    // zoom to 0.25, so this only triggers if the floor is lowered). Verify the
-    // threshold logic itself.
-    try std.testing.expect(lodSkipObjects(0.10));
-    try std.testing.expect(lodSkipObjects(0.0));
-}
-
-test "lodSkipWaves skips animation at low zoom" {
-    try std.testing.expect(!lodSkipWaves(1.0));
-    try std.testing.expect(!lodSkipWaves(0.5));
-    try std.testing.expect(lodSkipWaves(0.25));
-    try std.testing.expect(lodSkipWaves(0.0));
-}
 
 pub fn initFallbackTexture() void {
     if (fallback_tex != 0) return;
@@ -232,6 +199,10 @@ pub const App = struct {
     pak: ?PakFile = null,
     decoder: BmpDecoder = undefined,
     running: bool = true,
+    /// Perf measurement flag — when true the render loop records frame times.
+    perf_log: bool = false,
+    /// Exit after this many frames when perf_log is on (headless perf run).
+    perf_frames: u64 = 0,
     frame_count: u64 = 0,
     fps: f32 = 0,
     frame_times: [60]f64 = @splat(0),
@@ -359,6 +330,8 @@ pub const App = struct {
             .building_placer = BuildingPlacer.init(),
             .screenshot_exit_path = screenshot_exit_path,
             .screenshot_exit_frame = screenshot_exit_frame,
+            .perf_log = opts.perf_log,
+            .perf_frames = opts.perf_frames,
         };
     }
 
@@ -631,6 +604,21 @@ pub const App = struct {
         std.debug.print("  shader.program={}\n", .{self.shader.program});
 
         var frames: u64 = 0;
+        // Perf measurement: when self.perf_log is set, record per-frame render
+        // time (ms) and print a summary at exit. Used to decide whether LOD
+        // skipping (Phase 2) is needed on top of the offset-loop fix (Phase 1).
+        var perf_buf: [256]f32 = @splat(0);
+        var perf_n: usize = 0;
+        var perf_start: f64 = 0;
+        // Per-pass accumulators (seconds).
+        var perf_terrain_sum: f64 = 0;
+        var perf_sprites_sum: f64 = 0;
+        var perf_ui_sum: f64 = 0;
+        var perf_waves_sum: f64 = 0;
+        var perf_roads_sum: f64 = 0;
+        var perf_objects_sum: f64 = 0;
+        var perf_buildings_sum: f64 = 0;
+        const do_perf = self.perf_log;
         while (!glfw.windowShouldClose(self.window) and self.running) {
             glfw.pollEvents();
             self.handleInput();
@@ -650,6 +638,15 @@ pub const App = struct {
                 self.last_tick = const_tick;
             }
 
+            // Per-pass perf breakdown (only when do_perf).
+            var perf_terrain: f64 = 0;
+            var perf_sprites: f64 = 0;
+            var perf_ui: f64 = 0;
+            var perf_t0: f64 = 0;
+            if (do_perf) {
+                perf_start = glfw.getTime();
+                perf_t0 = perf_start;
+            }
             gl.clear(gl.GL_COLOR_BUFFER_BIT);
 
             // Render the hex map — NEAREST for pixel-exact fidelity to the
@@ -664,6 +661,7 @@ pub const App = struct {
             self.shader.setTexture(0);
             self.shader.setColor(1, 1, 1, 1);
             self.map_renderer.render(&self.camera);
+            if (do_perf) perf_terrain = glfw.getTime() - perf_t0;
 
             // Buildings & UI use NEAREST so pixel-art sprites stay crisp.
             if (self.atlas_loaded and self.atlas.uploaded) {
@@ -691,15 +689,30 @@ pub const App = struct {
             // Render objects (waves, roads, buildings, map objects). Each pass
             // loops over the active offset copies so every visible repeat of the
             // map (when zoomed out) shows its objects, not just the origin copy.
+            var perf_waves: f64 = 0;
+            var perf_roads: f64 = 0;
+            var perf_objects: f64 = 0;
+            var perf_buildings: f64 = 0;
+            if (do_perf) perf_t0 = glfw.getTime();
             self.renderWaves(const_tick);
+            if (do_perf) perf_waves = glfw.getTime() - perf_t0;
+            if (do_perf) perf_t0 = glfw.getTime();
             self.renderRoads();
+            if (do_perf) perf_roads = glfw.getTime() - perf_t0;
+            if (do_perf) perf_t0 = glfw.getTime();
             self.renderMapObjects();
+            if (do_perf) perf_objects = glfw.getTime() - perf_t0;
+            if (do_perf) perf_t0 = glfw.getTime();
             self.renderBuildings();
+            if (do_perf) perf_buildings = glfw.getTime() - perf_t0;
+            if (do_perf) perf_sprites = perf_waves + perf_roads + perf_objects + perf_buildings;
             self.camera.matrices_dirty = true;
 
             // Render UI overlay (HUD + minimap + building ghost)
             if (self.show_hud and frames > 0) {
+                if (do_perf) perf_t0 = glfw.getTime();
                 self.renderUI(const_tick);
+                if (do_perf) perf_ui = glfw.getTime() - perf_t0;
             }
 
             // F12 screenshot: capture the framebuffer after all rendering, but
@@ -719,13 +732,52 @@ pub const App = struct {
                 }
             }
 
+            // --perf with --perf-frames: headless perf run, exit after N frames.
+            if (do_perf and self.perf_frames > 0 and frames >= self.perf_frames) {
+                self.running = false;
+            }
+
             glfw.swapBuffers(self.window);
             self.frame_count += 1;
             frames += 1;
 
+            if (do_perf) {
+                const dt_ms: f32 = @floatCast((glfw.getTime() - perf_start) * 1000.0);
+                if (perf_n < perf_buf.len) {
+                    perf_buf[perf_n] = dt_ms;
+                    perf_n += 1;
+                }
+                perf_terrain_sum += perf_terrain;
+                perf_sprites_sum += perf_sprites;
+                perf_ui_sum += perf_ui;
+                perf_waves_sum += perf_waves;
+                perf_roads_sum += perf_roads;
+                perf_objects_sum += perf_objects;
+                perf_buildings_sum += perf_buildings;
+            }
+
             if (frames == 1) std.debug.print("  frame 1 ok\n", .{});
         }
         std.debug.print("  run done: {} frames\n", .{frames});
+
+        // Perf summary: print min/avg/max/p95 frame time (ms) and effective FPS.
+        if (do_perf and perf_n > 0) {
+            var min_ms: f32 = perf_buf[0];
+            var max_ms: f32 = perf_buf[0];
+            var sum: f32 = 0;
+            for (perf_buf[0..perf_n]) |t| {
+                if (t < min_ms) min_ms = t;
+                if (t > max_ms) max_ms = t;
+                sum += t;
+            }
+            const avg_ms = sum / @as(f32, @floatFromInt(perf_n));
+            // p95
+            std.mem.sort(f32, perf_buf[0..perf_n], {}, std.sort.asc(f32));
+            const p95_idx = @min(perf_n - 1, (perf_n * 95) / 100);
+            const p95_ms = perf_buf[p95_idx];
+            const n_f: f64 = @floatFromInt(perf_n);
+            std.log.info("perf: frames={d} min={d:.2}ms avg={d:.2}ms p95={d:.2}ms max={d:.2}ms fps={d:.1} | terrain={d:.2}ms waves={d:.2}ms roads={d:.2}ms objects={d:.2}ms buildings={d:.2}ms ui={d:.2}ms", .{ perf_n, min_ms, avg_ms, p95_ms, max_ms, 1000.0 / avg_ms, (perf_terrain_sum / n_f) * 1000.0, (perf_waves_sum / n_f) * 1000.0, (perf_roads_sum / n_f) * 1000.0, (perf_objects_sum / n_f) * 1000.0, (perf_buildings_sum / n_f) * 1000.0, (perf_ui_sum / n_f) * 1000.0 });
+        }
     }
 
     /// Capture the current framebuffer to a 24-bit BMP file at `path`.
@@ -898,16 +950,6 @@ pub const App = struct {
         const tex: *Texture = if (self.atlas_loaded and self.atlas.uploaded) &atlas_tex else &white_tex;
         self.setupAutoFlush(batcher, tex);
         batcher.begin();
-
-        // LOD: when zoomed out so far that tree/rock sprites (~48px tall)
-        // shrink below a few screen pixels, skip the whole object pass — the
-        // terrain colour already conveys the landscape, and per-tile sprites at
-        // sub-pixel sizes only cost fill rate. Buildings (renderBuildings) are
-        // still drawn because they are fewer and structurally important.
-        if (self.camera.zoom < LOD_SKIP_OBJECTS_ZOOM) {
-            batcher.render(&self.shader, tex, cam);
-            return;
-        }
 
         // Viewport culling: only iterate tiles that are visible through the
         // camera, instead of the entire map. The iterator handles torus
@@ -1312,9 +1354,6 @@ pub const App = struct {
     /// giving 16 cycling frames (PAK 630-645).
     fn renderWaves(self: *App, tick: u64) void {
         if (!(self.atlas_loaded and self.atlas.uploaded)) return;
-        // LOD: skip wave animation when zoomed out far enough that the 19px
-        // wave sprites become noise. Terrain water colour still renders.
-        if (self.camera.zoom < LOD_SKIP_WAVES_ZOOM) return;
         const batcher = &self.sprite_batcher;
         const cam = &self.camera;
         const tw: f32 = map_renderer_mod.TileWidth;

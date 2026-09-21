@@ -42,6 +42,8 @@ const CliOptions = struct {
     save_map: ?[]const u8 = null,
     screenshot: ?[]const u8 = null,
     zoom: ?f32 = null,
+    perf: bool = false,
+    perf_frames: u64 = 0,
     help: bool = false,
 };
 
@@ -91,6 +93,11 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !CliOptions {
         } else if (std.mem.eql(u8, arg, "--zoom")) {
             const val = it.next() orelse return error.MissingValue;
             opts.zoom = std.fmt.parseFloat(f32, val) catch return error.InvalidSeed;
+        } else if (std.mem.eql(u8, arg, "--perf")) {
+            opts.perf = true;
+        } else if (std.mem.eql(u8, arg, "--perf-frames")) {
+            const val = it.next() orelse return error.MissingValue;
+            opts.perf_frames = std.fmt.parseInt(u64, val, 10) catch return error.InvalidSeed;
         } else if (std.mem.eql(u8, arg, "--map-size")) {
             // Parse both values into temporaries and only commit to `opts`
             // when both succeed, so a bad height does not leave a lopsided
@@ -256,6 +263,8 @@ fn runGlfwDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
         .save_map = opts.save_map,
         .screenshot = opts.screenshot,
         .initial_zoom = opts.zoom orelse 2.0,
+        .perf_log = opts.perf,
+        .perf_frames = opts.perf_frames,
     });
     errdefer app.deinit();
 
