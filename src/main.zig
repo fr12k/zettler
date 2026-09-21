@@ -40,6 +40,7 @@ const CliOptions = struct {
     seed: ?u64 = null,
     map_file: ?[]const u8 = null,
     save_map: ?[]const u8 = null,
+    screenshot: ?[]const u8 = null,
     help: bool = false,
 };
 
@@ -84,6 +85,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !CliOptions {
             opts.map_file = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--save-map")) {
             opts.save_map = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--screenshot")) {
+            opts.screenshot = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--map-size")) {
             // Parse both values into temporaries and only commit to `opts`
             // when both succeed, so a bad height does not leave a lopsided
@@ -199,6 +202,8 @@ fn printUsage() void {
         \\                       instead of generating a new map.
         \\  --save-map <path>     Write the current map to this path so it can
         \\                       be replayed later with --map-file.
+        \\  --screenshot <path>  Render N frames then write a BMP screenshot
+        \\                       to this path and exit (headless capture).
         \\  -h, --help            Show this help and exit.
         \\
         \\Map sizes from {d}x{d} to {d}x{d} are supported.
@@ -242,6 +247,7 @@ fn runGlfwDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
         .seed = opts.seed,
         .map_file = opts.map_file,
         .save_map = opts.save_map,
+        .screenshot = opts.screenshot,
     });
     errdefer app.deinit();
 

@@ -58,6 +58,13 @@ pub const AppOptions = struct {
     seed: ?u64 = null,
     map_file: ?[]const u8 = null,
     save_map: ?[]const u8 = null,
+    /// When set, the render loop writes a BMP screenshot to this path after
+    /// `screenshot_frame` frames and then exits. Used for headless capture.
+    screenshot: ?[]const u8 = null,
+    /// Frame index at which to capture the `screenshot` (and exit). Enough
+    /// frames for the demo scene to construct and the economy to produce
+    /// a few resources so the HUD shows non-zero counts.
+    screenshot_frame: u64 = 300,
 };
 
 /// A 1x1 white fallback texture for when the real atlas isn't loaded.
@@ -200,6 +207,13 @@ pub const App = struct {
     building_placer: BuildingPlacer,
     road_builder: RoadBuilder = .{},
     show_hud: bool = true,
+    /// Path to write the next framebuffer capture to (set by F12). When
+    /// non-null, the render loop writes a BMP and clears it next frame.
+    screenshot_path: ?[]const u8 = null,
+    /// When non-null, the render loop captures a screenshot at
+    /// `screenshot_exit_frame` and then exits. Set via `--screenshot <path>`.
+    screenshot_exit_path: ?[]const u8 = null,
+    screenshot_exit_frame: u64 = 300,
     /// Live window size (window/screen coordinates — the same space GLFW reports
     /// the cursor in). UI projection + panel/minimap layout track this so the
     /// HUD stays aligned with the mouse after the window is resized. Hardcoding
@@ -250,6 +264,11 @@ pub const App = struct {
         }
         std.log.info("map seed: {}", .{game_state.map_seed});
 
+        // Headless screenshot capture: when --screenshot <path> is set, the
+        // render loop writes a BMP after `screenshot_frame` frames and exits.
+        const screenshot_exit_path = opts.screenshot;
+        const screenshot_exit_frame = opts.screenshot_frame;
+
         var camera = Camera{};
         camera.setViewportSize(WINDOW_WIDTH, WINDOW_HEIGHT);
         // Center on the middle of the actual map. The isometric projection is
@@ -279,6 +298,8 @@ pub const App = struct {
             .panel = Panel.init(),
             .minimap = Minimap.init(),
             .building_placer = BuildingPlacer.init(),
+            .screenshot_exit_path = screenshot_exit_path,
+            .screenshot_exit_frame = screenshot_exit_frame,
         };
     }
 
@@ -605,6 +626,23 @@ pub const App = struct {
                 self.renderUI(const_tick);
             }
 
+            // F12 screenshot: capture the framebuffer after all rendering, but
+            // before swapBuffers (which may invalidate the back buffer).
+            if (self.screenshot_path) |path| {
+                self.captureScreenshot(path);
+                self.screenshot_path = null;
+            }
+
+            // --screenshot <path>: headless capture at the target frame, then exit.
+            if (self.screenshot_exit_path) |path| {
+                if (frames >= self.screenshot_exit_frame) {
+                    self.captureScreenshot(path);
+                    std.log.info("screenshot written to {s}", .{path});
+                    self.running = false;
+                    self.screenshot_exit_path = null;
+                }
+            }
+
             glfw.swapBuffers(self.window);
             self.frame_count += 1;
             frames += 1;
@@ -613,6 +651,116 @@ pub const App = struct {
         }
         std.debug.print("  run done: {} frames\n", .{frames});
     }
+
+    /// Capture the current framebuffer to a 24-bit BMP file at `path`.
+    /// Uses `glReadPixels` (GL_RGB, top-row-first) and flips rows for BMP's
+    /// bottom-up convention. Best-effort: errors are logged but swallowed.
+    pub fn captureScreenshot(self: *App, path: []const u8) void {
+        captureScreenshotImpl(self, path) catch |err| {
+            std.log.warn("screenshot capture failed: {}", .{err});
+        };
+    }
+
+    fn captureScreenshotImpl(self: *App, path: []const u8) !void {
+        const fb = glfw.getFramebufferSize(self.window);
+        const w: usize = @intCast(@max(fb.width, 1));
+        const h: usize = @intCast(@max(fb.height, 1));
+
+        // Read the framebuffer as GL_BGR (blue, green, red) — this is the exact
+        // byte order a 24-bit BMP stores, so no per-pixel channel swap is
+        // needed. OpenGL's framebuffer origin is the BOTTOM-left, so the first
+        // row returned is the bottom row of the screen — which is also what a
+        // bottom-up BMP wants, so no vertical flip is needed either.
+        const row_bytes = w * 3;
+        const buf_size = row_bytes * h;
+        const bgr = try self.allocator.alloc(u8, buf_size);
+        defer self.allocator.free(bgr);
+
+        gl.readPixels(0, 0, fb.width, fb.height, gl.GL_BGR, gl.GL_UNSIGNED_BYTE, bgr);
+
+        // Build the BMP file in memory. 24-bit, bottom-up rows, each row
+        // padded to a 4-byte boundary. The pixel data is already in BGR
+        // bottom-up order from glReadPixels, so we copy it forward as-is.
+        const row_stride = (row_bytes + 3) & ~@as(usize, 3);
+        const pixel_data_size = row_stride * h;
+        const file_size = 14 + 40 + pixel_data_size;
+
+        const bmp = try self.allocator.alloc(u8, file_size);
+        defer self.allocator.free(bmp);
+        var p: usize = 0;
+
+        // BMP file header (14 bytes).
+        bmp[p + 0] = 'B';
+        bmp[p + 1] = 'M';
+        std.mem.writeInt(u32, bmp[p + 2..][0..4], @intCast(file_size), .little);
+        std.mem.writeInt(u16, bmp[p + 6..][0..2], 0, .little); // reserved
+        std.mem.writeInt(u16, bmp[p + 8..][0..2], 0, .little); // reserved
+        std.mem.writeInt(u32, bmp[p + 10..][0..4], 14 + 40, .little); // pixel data offset
+        p += 14;
+
+        // DIB header (BITMAPINFOHEADER, 40 bytes).
+        std.mem.writeInt(u32, bmp[p + 0..][0..4], 40, .little);
+        std.mem.writeInt(i32, bmp[p + 4..][0..4], @intCast(w), .little);
+        std.mem.writeInt(i32, bmp[p + 8..][0..4], @intCast(h), .little);
+        std.mem.writeInt(u16, bmp[p + 12..][0..2], 1, .little); // planes
+        std.mem.writeInt(u16, bmp[p + 14..][0..2], 24, .little); // bpp
+        std.mem.writeInt(u32, bmp[p + 16..][0..4], 0, .little); // compression (BI_RGB)
+        std.mem.writeInt(u32, bmp[p + 20..][0..4], @intCast(pixel_data_size), .little);
+        std.mem.writeInt(i32, bmp[p + 24..][0..4], 2835, .little); // x ppm (~72 dpi)
+        std.mem.writeInt(i32, bmp[p + 28..][0..4], 2835, .little); // y ppm
+        std.mem.writeInt(u32, bmp[p + 32..][0..4], 0, .little); // colors used
+        std.mem.writeInt(u32, bmp[p + 36..][0..4], 0, .little); // important colors
+        p += 40;
+
+        // Pixel data: already in BGR bottom-up order from glReadPixels, so
+        // copy rows forward (first read row = bottom of screen = first BMP
+        // row). Pad each row to a 4-byte boundary.
+        const pad = row_stride - row_bytes;
+        var y: usize = 0;
+        while (y < h) : (y += 1) {
+            const src = bgr[y * row_bytes ..][0..row_bytes];
+            @memcpy(bmp[p..][0..row_bytes], src);
+            p += row_bytes;
+            if (pad > 0) {
+                @memset(bmp[p..][0..pad], 0);
+                p += pad;
+            }
+        }
+        std.debug.assert(p == file_size);
+
+        // Write the file via the C API (std.fs.cwd() is unavailable in this
+        // Zig build). Mirror Map.saveToFile's pattern.
+        const c_path = try self.allocator.alloc(u8, path.len + 1);
+        defer self.allocator.free(c_path);
+        @memcpy(c_path[0..path.len], path);
+        c_path[path.len] = 0;
+
+        const fd = @as(c_int, @intCast(std.c.open(@ptrCast(c_path.ptr), .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+        }, @as(std.c.mode_t, 0o664))));
+        if (fd < 0) return error.SaveFailed;
+        defer _ = std.c.close(fd);
+
+        if (writeAllFd(fd, bmp) < 0) return error.WriteError;
+    }
+
+    /// Write the full buffer to `fd`, looping over short writes. Returns the
+    /// number of bytes written (== buf.len) on success, or a negative value on
+    /// failure. (Local copy of Map.zig's helper; std.fs.cwd() is unavailable
+    /// in this Zig build.)
+    fn writeAllFd(fd: c_int, buf: []const u8) isize {
+        var written: usize = 0;
+        while (written < buf.len) {
+            const w = std.c.write(fd, buf.ptr + written, buf.len - written);
+            if (w < 0) return w;
+            if (w == 0) return -1;
+            written += @intCast(w);
+        }
+        return @intCast(written);
+    }
+
 
     /// Update the live window size used by the UI projection, camera and panel
     /// layout. Call whenever the window size changes (and once at startup).
@@ -1407,6 +1555,11 @@ fn onKey(_: *glfw.GLFWwindow, key: c_int, _: c_int, action: c_int, _: c_int) cal
             app.building_placer.deactivate();
             app.road_builder.deactivate();
             app.panel.tool_mode = .none;
+        }
+
+        // F12 = capture a screenshot to screenshot.bmp in the cwd.
+        if (key == glfw.GLFW_KEY_F12 and action == glfw.GLFW_PRESS) {
+            app.screenshot_path = "screenshot.bmp";
         }
     }
 }

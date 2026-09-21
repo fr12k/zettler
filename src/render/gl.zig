@@ -65,6 +65,7 @@ pub const GL_CLAMP_TO_EDGE: GLenum = 0x812F;
 pub const GL_REPEAT: GLenum = 0x2901;
 pub const GL_RGBA: GLenum = 0x1908;
 pub const GL_RGB: GLenum = 0x1907;
+pub const GL_BGR: GLenum = 0x80E0;
 pub const GL_ALPHA: GLenum = 0x1906;
 pub const GL_LUMINANCE: GLenum = 0x1909;
 pub const GL_LUMINANCE_ALPHA: GLenum = 0x190A;
