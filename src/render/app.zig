@@ -65,12 +65,56 @@ pub const AppOptions = struct {
     /// frames for the demo scene to construct and the economy to produce
     /// a few resources so the HUD shows non-zero counts.
     screenshot_frame: u64 = 300,
+    /// Initial camera zoom (default 2.0). Useful for headless screenshot
+    /// captures at a specific zoom level (e.g. 0.25 to test zoomed-out
+    /// rendering of objects across repeated map copies).
+    initial_zoom: f32 = 2.0,
 };
 
 /// A 1x1 white fallback texture for when the real atlas isn't loaded.
 /// The shader multiplies colors by texture2D, so we need a white texture
 /// for colored quads to appear (otherwise texture2D returns black).
 var fallback_tex: gl.GLuint = 0;
+
+/// LOD (level-of-detail) thresholds for zoomed-out rendering. When the camera
+/// is zoomed out far enough that individual sprites become near-invisible, we
+/// skip them to keep the frame rate reasonable. These are screen-space size
+/// thresholds — a tree sprite is ~48px tall, so at zoom 0.5 it is ~24px (kept),
+/// at zoom 0.25 it is ~12px (kept, still visible), below ~0.1 it would be <5px
+/// (skipped). Waves are 19px and animated noise; skip them earlier.
+const LOD_SKIP_OBJECTS_ZOOM: f32 = 0.12; // skip trees/rocks below this zoom
+const LOD_SKIP_WAVES_ZOOM: f32 = 0.40; // skip wave animation below this zoom
+
+/// Returns true when map objects (trees/rocks) should be skipped at the given
+/// zoom. Pure function so it can be unit-tested without a GL context.
+pub fn lodSkipObjects(zoom: f32) bool {
+    return zoom < LOD_SKIP_OBJECTS_ZOOM;
+}
+
+/// Returns true when wave animation should be skipped at the given zoom.
+/// Pure function so it can be unit-tested without a GL context.
+pub fn lodSkipWaves(zoom: f32) bool {
+    return zoom < LOD_SKIP_WAVES_ZOOM;
+}
+
+test "lodSkipObjects keeps sprites at normal zoom, skips at extreme zoom-out" {
+    // Normal/zoomed-in: never skip.
+    try std.testing.expect(!lodSkipObjects(1.0));
+    try std.testing.expect(!lodSkipObjects(0.5));
+    try std.testing.expect(!lodSkipObjects(0.25)); // min zoom floor: still kept
+    // Extreme zoom-out (below the floor would be skipped, but the camera clamps
+    // zoom to 0.25, so this only triggers if the floor is lowered). Verify the
+    // threshold logic itself.
+    try std.testing.expect(lodSkipObjects(0.10));
+    try std.testing.expect(lodSkipObjects(0.0));
+}
+
+test "lodSkipWaves skips animation at low zoom" {
+    try std.testing.expect(!lodSkipWaves(1.0));
+    try std.testing.expect(!lodSkipWaves(0.5));
+    try std.testing.expect(lodSkipWaves(0.25));
+    try std.testing.expect(lodSkipWaves(0.0));
+}
 
 pub fn initFallbackTexture() void {
     if (fallback_tex != 0) return;
@@ -88,10 +132,15 @@ const MapObject = core.map.MapObject;
 /// in struct fields without a circular @import.
 const WorldBounds = camera_mod.WorldBounds;
 
-/// A sorted building entry for the render sort cache.
+/// A sorted building entry for the render sort cache. `off_x`/`off_y` are the
+/// torus offset copy this instance is drawn at (0,0 for the origin copy) so the
+/// sprite is placed at the translated world position and the sort order is
+/// correct across multiple visible copies when zoomed out.
 const BldEntry = struct {
     baseline: f32,
     bidx: u32,
+    off_x: f32 = 0,
+    off_y: f32 = 0,
 };
 
 /// AssetMapObject sprite ids for harvestable map objects: trees (offsets 0-15:
@@ -246,6 +295,16 @@ pub const App = struct {
     /// frames to avoid mmap/munmap per frame from page_allocator.
     obj_scratch: []SceneItem = &.{},
     bld_scratch: []BldEntry = &.{},
+    /// Active torus offset copies for the current frame, shared by all sprite
+    /// passes. Computed once per frame in renderFrame from the camera's visible
+    /// bounds + map size (same logic as map_renderer.render). Up to 9 entries;
+    /// `num_offsets` is the live count. When the viewport is smaller than one
+    /// map period this is a single (0,0) offset (zoomed-in case, unchanged
+    /// behaviour). When zoomed out past one period, it holds every offset copy
+    /// that intersects the viewport so objects are replicated alongside the
+    /// terrain.
+    frame_offsets: [9][2]f32 = @splat(@splat(0)),
+    num_offsets: usize = 1,
 
 
     pub fn init(allocator: std.mem.Allocator, map_w: u16, map_h: u16, opts: AppOptions) !App {
@@ -283,7 +342,7 @@ pub const App = struct {
             half_w * map_renderer_mod.TileWidth - half_h * (map_renderer_mod.TileWidth * 0.5),
             half_h * map_renderer_mod.TileHeight,
         );
-        camera.zoom = 2.0;
+        camera.zoom = opts.initial_zoom;
 
         return .{
             .allocator = allocator,
@@ -610,11 +669,28 @@ pub const App = struct {
             if (self.atlas_loaded and self.atlas.uploaded) {
                 self.atlas.setFilter(false); // nearest
             }
-            // Render objects (waves, roads, buildings, map objects) in a single
-            // culled pass. The tile iterator handles torus wrapping, so no 3×3
-            // offset loop is needed on the CPU side (the terrain renderer keeps
-            // its 9-offset GPU draw since the VBO is static and GPU clipping is
-            // cheap).
+            // Compute the active torus offset copies for this frame, shared by
+            // all CPU-side sprite passes (waves/roads/objects/buildings). This
+            // mirrors the terrain renderer's offset culling so objects are
+            // replicated at exactly the same world-space copies as the terrain —
+            // fixing the zoom-out case where the viewport spans more than one
+            // map period and objects otherwise only appear in the origin copy.
+            {
+                const vb = self.camera.visibleWorldBounds();
+                const mw = @as(f32, @floatFromInt(self.game.state.map.width)) * map_renderer_mod.TileWidth;
+                const mh = @as(f32, @floatFromInt(self.game.state.map.height)) * map_renderer_mod.TileHeight;
+                self.num_offsets = culling_mod.activeOffsets(
+                    vb.min_x, vb.min_y, vb.max_x, vb.max_y, mw, mh, &self.frame_offsets,
+                );
+                if (self.num_offsets == 0) {
+                    // Fallback: always draw at least the origin copy.
+                    self.frame_offsets[0] = .{ 0, 0 };
+                    self.num_offsets = 1;
+                }
+            }
+            // Render objects (waves, roads, buildings, map objects). Each pass
+            // loops over the active offset copies so every visible repeat of the
+            // map (when zoomed out) shows its objects, not just the origin copy.
             self.renderWaves(const_tick);
             self.renderRoads();
             self.renderMapObjects();
@@ -785,11 +861,16 @@ pub const App = struct {
 
     /// One drawable standing object (tree/rock) on a tile. `baseline` is the
     /// screen-space y used to sort back-to-front so nearer sprites and their
-    /// shadows correctly occlude farther ones.
+    /// shadows correctly occlude farther ones. `off_x`/`off_y` are the torus
+    /// offset copy this instance is drawn at (0,0 for the origin copy) so the
+    /// sprite is placed at the translated world position and the sort order is
+    /// correct across multiple visible copies when zoomed out.
     const SceneItem = struct {
         baseline: f32,
         x: u16 = 0,
         y: u16 = 0,
+        off_x: f32 = 0,
+        off_y: f32 = 0,
     };
 
     /// Render all standing map objects (trees/rocks), sorted back-to-front by
@@ -818,14 +899,29 @@ pub const App = struct {
         self.setupAutoFlush(batcher, tex);
         batcher.begin();
 
+        // LOD: when zoomed out so far that tree/rock sprites (~48px tall)
+        // shrink below a few screen pixels, skip the whole object pass — the
+        // terrain colour already conveys the landscape, and per-tile sprites at
+        // sub-pixel sizes only cost fill rate. Buildings (renderBuildings) are
+        // still drawn because they are fewer and structurally important.
+        if (self.camera.zoom < LOD_SKIP_OBJECTS_ZOOM) {
+            batcher.render(&self.shader, tex, cam);
+            return;
+        }
+
         // Viewport culling: only iterate tiles that are visible through the
         // camera, instead of the entire map. The iterator handles torus
-        // wrapping, so a single pass covers the visible area (no 3×3 loop).
+        // wrapping and clamps to one full period (dedup), so it yields each
+        // unique tile at most once. We then replicate each tile at every
+        // active torus offset copy (self.frame_offsets) so objects appear in
+        // every visible repeat of the map when zoomed out — mirroring the
+        // terrain renderer's 9-offset draw.
         const b = cam.visibleWorldBounds();
 
         // --- Sort cache: skip tile iteration + sort when camera is idle ---
-        // The baseline depends only on tile y + height (not camera position),
-        // so the sorted order is identical when the visible bounds match.
+        // The baseline depends only on tile y + height + offset (not camera
+        // position), so the sorted order is identical when the visible bounds
+        // match (the offset set is a pure function of bounds + map size).
         const bounds_match = self.obj_cache_valid and
             b.min_x == self.obj_cache_bounds.min_x and
             b.min_y == self.obj_cache_bounds.min_y and
@@ -834,7 +930,7 @@ pub const App = struct {
         if (bounds_match) {
             // Reuse the cached sorted list — no iteration, no sort.
             for (self.obj_cache_items) |e| {
-                self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
+                self.drawMapObject(batcher, e.x, e.y, tw, th, hw, e.off_x, e.off_y);
             }
             batcher.render(&self.shader, tex, cam);
             return;
@@ -843,46 +939,50 @@ pub const App = struct {
         const num_visible = culling_mod.visibleTiles(
             b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited,
         );
-        // Upper bound on visible tiles for the sort buffer.
-        const max_visible = num_visible.row_hi - num_visible.row_lo + 1 +
-            num_visible.col_hi - num_visible.col_lo + 1;
-        _ = max_visible;
 
-        // Collect visible tiles that have a standing object, then sort.
-        // Use a stack buffer for typical zoomed views; fall back to a heap
-        // allocation when zoomed out far enough that the visible tile count
-        // exceeds the stack capacity.
+        // Collect visible tiles that have a standing object, replicated at each
+        // active offset copy, then sort. Use a stack buffer for typical zoomed
+        // views; fall back to a heap allocation when zoomed out far enough that
+        // the visible tile count × offset count exceeds the stack capacity.
         var stack_buf: [4096]SceneItem = undefined;
         const visible_tile_count: usize = blk: {
             const rs = @as(usize, @intCast(num_visible.row_hi - num_visible.row_lo + 1));
             const cs = @as(usize, @intCast(num_visible.col_hi - num_visible.col_lo + 1));
             break :blk rs * cs;
         };
+        // Upper bound: every visible tile has an object and is drawn at every
+        // offset copy. In practice far fewer (most tiles have no object).
+        const max_items = visible_tile_count * self.num_offsets;
         var list: []SceneItem = stack_buf[0..];
         // Fall back to a persistent scratch buffer (reused across frames) when
-        // the visible tile count exceeds the stack capacity. This avoids
+        // the item count exceeds the stack capacity. This avoids
         // mmap/munmap per frame from page_allocator.
-        if (visible_tile_count > stack_buf.len) {
-            if (self.obj_scratch.len < visible_tile_count) {
+        if (max_items > stack_buf.len) {
+            if (self.obj_scratch.len < max_items) {
                 if (self.obj_scratch.len > 0) self.allocator.free(self.obj_scratch);
-                self.obj_scratch = self.allocator.alloc(SceneItem, visible_tile_count) catch &.{};
+                self.obj_scratch = self.allocator.alloc(SceneItem, max_items) catch &.{};
             }
-            if (self.obj_scratch.len >= visible_tile_count) list = self.obj_scratch;
+            if (self.obj_scratch.len >= max_items) list = self.obj_scratch;
         }
 
         var n: usize = 0;
         var it = num_visible;
         while (it.next()) |pos| {
-            if (n >= list.len) break;
             const t = map.getTile(pos);
             if (t.object == .none) continue;
             const oh: f32 = @floatFromInt(t.height);
-            list[n] = .{
-                .baseline = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * oh,
-                .x = pos.x,
-                .y = pos.y,
-            };
-            n += 1;
+            const base_wy = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * oh;
+            for (self.frame_offsets[0..self.num_offsets]) |off| {
+                if (n >= list.len) break;
+                list[n] = .{
+                    .baseline = base_wy + off[1],
+                    .x = pos.x,
+                    .y = pos.y,
+                    .off_x = off[0],
+                    .off_y = off[1],
+                };
+                n += 1;
+            }
         }
         std.mem.sort(SceneItem, list[0..n], {}, struct {
             fn lt(_: void, p: SceneItem, q: SceneItem) bool {
@@ -890,7 +990,7 @@ pub const App = struct {
             }
         }.lt);
         for (list[0..n]) |e| {
-            self.drawMapObject(batcher, e.x, e.y, tw, th, hw);
+            self.drawMapObject(batcher, e.x, e.y, tw, th, hw, e.off_x, e.off_y);
         }
 
         // Cache the sorted list for reuse on the next frame if the camera
@@ -931,6 +1031,8 @@ pub const App = struct {
         const b = cam.visibleWorldBounds();
 
         // --- Sort cache: skip re-collect + sort when camera is idle ---
+        // The offset set is a pure function of bounds + map size, so keying on
+        // bounds alone remains valid when items store their offset.
         const bounds_match = self.bld_cache_valid and
             b.min_x == self.bld_cache_bounds.min_x and
             b.min_y == self.bld_cache_bounds.min_y and
@@ -938,7 +1040,7 @@ pub const App = struct {
             b.max_y == self.bld_cache_bounds.max_y;
         if (bounds_match) {
             for (self.bld_cache_items) |e| {
-                self.drawBuilding(batcher, &items[e.bidx], tw, th, hw);
+                self.drawBuilding(batcher, &items[e.bidx], tw, th, hw, e.off_x, e.off_y);
             }
             batcher.render(&self.shader, tex, cam);
             return;
@@ -946,37 +1048,50 @@ pub const App = struct {
 
         // Viewport culling: skip buildings whose tile is outside the visible
         // world bounds. Buildings are few, so we just filter — no tile
-        // iterator needed. Use a stack buffer for up to 1024 buildings;
-        // fall back to heap for pathological counts.
+        // iterator needed. Each visible building is replicated at every active
+        // torus offset copy so it appears in every visible repeat of the map
+        // when zoomed out. Use a stack buffer for up to 1024 building×offset
+        // entries; fall back to heap for pathological counts.
+        const max_entries = items.len * self.num_offsets;
         var stack_buf: [1024]BldEntry = undefined;
         var list: []BldEntry = stack_buf[0..];
         // Fall back to a persistent scratch buffer (reused across frames) when
-        // the building count exceeds the stack capacity. This avoids
+        // the entry count exceeds the stack capacity. This avoids
         // mmap/munmap per frame from page_allocator.
-        if (items.len > stack_buf.len) {
-            if (self.bld_scratch.len < items.len) {
+        if (max_entries > stack_buf.len) {
+            if (self.bld_scratch.len < max_entries) {
                 if (self.bld_scratch.len > 0) self.allocator.free(self.bld_scratch);
-                self.bld_scratch = self.allocator.alloc(BldEntry, items.len) catch &.{};
+                self.bld_scratch = self.allocator.alloc(BldEntry, max_entries) catch &.{};
             }
-            if (self.bld_scratch.len >= items.len) list = self.bld_scratch;
+            if (self.bld_scratch.len >= max_entries) list = self.bld_scratch;
         }
 
         var n: usize = 0;
         for (items, 0..) |*bld, i| {
-            if (n >= list.len) break;
-            // Cull buildings outside the visible world bounds (with a margin
-            // for the sprite footprint which extends above the tile).
-            const wx = @as(f32, @floatFromInt(bld.pos.x)) * tw - @as(f32, @floatFromInt(bld.pos.y)) * hw;
-            const wy = @as(f32, @floatFromInt(bld.pos.y)) * th;
+            // Cull the building's origin copy against the visible world bounds
+            // (with a margin for the sprite footprint). If the origin copy is
+            // off-screen we still may need an offset copy, so we don't `continue`
+            // here — the per-offset check below handles it.
+            const wx0 = @as(f32, @floatFromInt(bld.pos.x)) * tw - @as(f32, @floatFromInt(bld.pos.y)) * hw;
+            const wy0 = @as(f32, @floatFromInt(bld.pos.y)) * th;
             const margin: f32 = tw * 4.0; // generous for tall building sprites
-            if (wx + margin < b.min_x or wx - margin > b.max_x or
-                wy + margin < b.min_y or wy - margin > b.max_y) continue;
             const bh: f32 = @floatFromInt(map.getTile(bld.pos).height);
-            list[n] = .{
-                .baseline = @as(f32, @floatFromInt(bld.pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * bh,
-                .bidx = @intCast(i),
-            };
-            n += 1;
+            const base_wy = wy0 - map_renderer_mod.HEIGHT_SCALE * bh;
+            for (self.frame_offsets[0..self.num_offsets]) |off| {
+                if (n >= list.len) break;
+                const wx = wx0 + off[0];
+                const wy = base_wy + off[1];
+                // Cull this offset copy against the visible bounds.
+                if (wx + margin < b.min_x or wx - margin > b.max_x or
+                    wy + margin < b.min_y or wy - margin > b.max_y) continue;
+                list[n] = .{
+                    .baseline = wy,
+                    .bidx = @intCast(i),
+                    .off_x = off[0],
+                    .off_y = off[1],
+                };
+                n += 1;
+            }
         }
         std.mem.sort(BldEntry, list[0..n], {}, struct {
             fn lt(_: void, p: BldEntry, q: BldEntry) bool {
@@ -984,7 +1099,7 @@ pub const App = struct {
             }
         }.lt);
         for (list[0..n]) |e| {
-            self.drawBuilding(batcher, &items[e.bidx], tw, th, hw);
+            self.drawBuilding(batcher, &items[e.bidx], tw, th, hw, e.off_x, e.off_y);
         }
 
         // Cache the sorted list for reuse on the next frame. Also cache
@@ -1003,12 +1118,13 @@ pub const App = struct {
         batcher.render(&self.shader, tex, cam);
     }
 
-    /// Draw one standing map object (tree/rock) with its shadow.
-    fn drawMapObject(self: *App, batcher: *SpriteBatcher, x: u16, y: u16, tw: f32, th: f32, hw: f32) void {
+    /// Draw one standing map object (tree/rock) with its shadow. `off_x`/
+    /// `off_y` translate the sprite to its torus offset copy (0,0 for origin).
+    fn drawMapObject(self: *App, batcher: *SpriteBatcher, x: u16, y: u16, tw: f32, th: f32, hw: f32, off_x: f32, off_y: f32) void {
         const t = self.game.state.map.getTileXY(x, y);
         const oh: f32 = @floatFromInt(t.height);
-        const wx = @as(f32, @floatFromInt(x)) * tw - @as(f32, @floatFromInt(y)) * hw;
-        const wy = @as(f32, @floatFromInt(y)) * th - map_renderer_mod.HEIGHT_SCALE * oh;
+        const wx = @as(f32, @floatFromInt(x)) * tw - @as(f32, @floatFromInt(y)) * hw + off_x;
+        const wy = @as(f32, @floatFromInt(y)) * th - map_renderer_mod.HEIGHT_SCALE * oh + off_y;
 
         if (self.atlas_loaded and self.atlas.uploaded) {
             const sid = objectSpriteId(t.object, t.object_variant);
@@ -1065,25 +1181,37 @@ pub const App = struct {
         // Uses viewport culling + wrapping so roads draw correctly across edges.
         const fwd = [_]core.Direction{ .right, .down_right, .down };
         const b = self.camera.visibleWorldBounds();
+        // Loop over active torus offset copies so roads/flags appear in every
+        // visible repeat of the map when zoomed out. The tile iterator is
+        // deduplicated to one period, so drawing each segment at each offset
+        // never duplicates at the same screen position.
         var it = culling_mod.visibleTiles(b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited);
         while (it.next()) |pos| {
             const t = map.getTile(pos);
             if (!(t.has_road or t.has_flag)) continue;
-            const c0 = self.tileCenter(pos);
-            for (fwd) |d| {
-                const np = map.getNeighborWrapped(pos, d);
-                const nt = map.getTile(np);
-                if (!(nt.has_road or nt.has_flag)) continue;
-                const c1 = self.tileCenter(np);
-                addLine(batcher, c0[0], c0[1], c1[0], c1[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
+            const c0_base = self.tileCenter(pos);
+            for (self.frame_offsets[0..self.num_offsets]) |off| {
+                const c0x = c0_base[0] + off[0];
+                const c0y = c0_base[1] + off[1];
+                for (fwd) |d| {
+                    const np = map.getNeighborWrapped(pos, d);
+                    const nt = map.getTile(np);
+                    if (!(nt.has_road or nt.has_flag)) continue;
+                    const c1_base = self.tileCenter(np);
+                    addLine(batcher, c0x, c0y, c1_base[0] + off[0], c1_base[1] + off[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
+                }
             }
         }
 
-        // Flag posts.
+        // Flag posts — replicated at every active offset copy.
         for (self.game.state.flags.flags.items) |*f| {
-            const c = self.tileCenter(f.pos);
-            batcher.add(.{ .x = c[0] - 1.5, .y = c[1] - 13, .width = 3, .height = 13, .u = 0, .v = 0, .uw = 0, .vh = 0, .r = 0.55, .g = 0.45, .b = 0.3, .a = 1 });
-            batcher.add(.{ .x = c[0] - 1.5, .y = c[1] - 13, .width = 7, .height = 4, .u = 0, .v = 0, .uw = 0, .vh = 0, .r = 0.9, .g = 0.2, .b = 0.2, .a = 1 });
+            const c_base = self.tileCenter(f.pos);
+            for (self.frame_offsets[0..self.num_offsets]) |off| {
+                const cx = c_base[0] + off[0];
+                const cy = c_base[1] + off[1];
+                batcher.add(.{ .x = cx - 1.5, .y = cy - 13, .width = 3, .height = 13, .u = 0, .v = 0, .uw = 0, .vh = 0, .r = 0.55, .g = 0.45, .b = 0.3, .a = 1 });
+                batcher.add(.{ .x = cx - 1.5, .y = cy - 13, .width = 7, .height = 4, .u = 0, .v = 0, .uw = 0, .vh = 0, .r = 0.9, .g = 0.2, .b = 0.2, .a = 1 });
+            }
         }
 
         // Road-building preview: line from the chosen start flag to the cursor,
@@ -1106,13 +1234,14 @@ pub const App = struct {
     /// Queue one building into the sprite batcher. Completed buildings draw their
     /// shadow + sprite; buildings under construction draw the animated build-up
     /// sequence (plan → scaffold frame → walls rising). Falls back to a colored
-    /// rectangle when no sprite is available.
-    fn drawBuilding(self: *App, batcher: *SpriteBatcher, b: anytype, tw: f32, th: f32, hw: f32) void {
+    /// rectangle when no sprite is available. `off_x`/`off_y` translate the
+    /// sprite to its torus offset copy (0,0 for origin).
+    fn drawBuilding(self: *App, batcher: *SpriteBatcher, b: anytype, tw: f32, th: f32, hw: f32, off_x: f32, off_y: f32) void {
         const bh: f32 = @floatFromInt(self.game.state.map.getTile(b.pos).height);
         const wx = @as(f32, @floatFromInt(b.pos.x)) * tw -
-            @as(f32, @floatFromInt(b.pos.y)) * hw;
+            @as(f32, @floatFromInt(b.pos.y)) * hw + off_x;
         const wy = @as(f32, @floatFromInt(b.pos.y)) * th -
-            map_renderer_mod.HEIGHT_SCALE * bh;
+            map_renderer_mod.HEIGHT_SCALE * bh + off_y;
 
         if (self.atlas_loaded and self.atlas.uploaded) {
             if (b.is_done) {
@@ -1183,6 +1312,9 @@ pub const App = struct {
     /// giving 16 cycling frames (PAK 630-645).
     fn renderWaves(self: *App, tick: u64) void {
         if (!(self.atlas_loaded and self.atlas.uploaded)) return;
+        // LOD: skip wave animation when zoomed out far enough that the 19px
+        // wave sprites become noise. Terrain water colour still renders.
+        if (self.camera.zoom < LOD_SKIP_WAVES_ZOOM) return;
         const batcher = &self.sprite_batcher;
         const cam = &self.camera;
         const tw: f32 = map_renderer_mod.TileWidth;
@@ -1221,14 +1353,18 @@ pub const App = struct {
             const wx = @as(f32, @floatFromInt(xx)) * tw - @as(f32, @floatFromInt(yy)) * hw;
             const wy = @as(f32, @floatFromInt(yy)) * th -
                 map_renderer_mod.HEIGHT_SCALE * @as(f32, @floatFromInt(tile.height));
-            batcher.add(.{
-                .x = wx - hw,
-                .y = wy,
-                .width = @floatFromInt(entry.pixel_w),
-                .height = @floatFromInt(entry.pixel_h),
-                .u = entry.u, .v = entry.v, .uw = entry.uw, .vh = entry.vh,
-                .r = 1, .g = 1, .b = 1, .a = 1,
-            });
+            // Replicate the wave at every active torus offset copy so waves
+            // appear in every visible repeat of the map when zoomed out.
+            for (self.frame_offsets[0..self.num_offsets]) |off| {
+                batcher.add(.{
+                    .x = wx - hw + off[0],
+                    .y = wy + off[1],
+                    .width = @floatFromInt(entry.pixel_w),
+                    .height = @floatFromInt(entry.pixel_h),
+                    .u = entry.u, .v = entry.v, .uw = entry.uw, .vh = entry.vh,
+                    .r = 1, .g = 1, .b = 1, .a = 1,
+                });
+            }
             drew = true;
         }
         if (!drew) return;

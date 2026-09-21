@@ -82,6 +82,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_core_tests.step);
 
+    // Test step for render module (culling, camera math). The render module
+    // depends on core, so its tests cover the viewport-culling helpers used by
+    // the sprite passes.
+    const render_tests = b.addTest(.{
+        .root_module = render_mod,
+    });
+    render_tests.root_module.link_libc = true;
+    const run_render_tests = b.addRunArtifact(render_tests);
+    test_step.dependOn(&run_render_tests.step);
+
     // Integration test: verify TPWM decompression + PAK parsing on real data
     const real_data_exe = b.addExecutable(.{
         .name = "test-real-data",

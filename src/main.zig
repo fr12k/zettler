@@ -41,6 +41,7 @@ const CliOptions = struct {
     map_file: ?[]const u8 = null,
     save_map: ?[]const u8 = null,
     screenshot: ?[]const u8 = null,
+    zoom: ?f32 = null,
     help: bool = false,
 };
 
@@ -87,6 +88,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !CliOptions {
             opts.save_map = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--screenshot")) {
             opts.screenshot = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--zoom")) {
+            const val = it.next() orelse return error.MissingValue;
+            opts.zoom = std.fmt.parseFloat(f32, val) catch return error.InvalidSeed;
         } else if (std.mem.eql(u8, arg, "--map-size")) {
             // Parse both values into temporaries and only commit to `opts`
             // when both succeed, so a bad height does not leave a lopsided
@@ -204,6 +208,9 @@ fn printUsage() void {
         \\                       be replayed later with --map-file.
         \\  --screenshot <path>  Render N frames then write a BMP screenshot
         \\                       to this path and exit (headless capture).
+        \\  --zoom <f32>          Set the initial camera zoom (default 2.0;
+        \\                       min 0.25). Useful with --screenshot to capture
+        \\                       a zoomed-out view.
         \\  -h, --help            Show this help and exit.
         \\
         \\Map sizes from {d}x{d} to {d}x{d} are supported.
@@ -248,6 +255,7 @@ fn runGlfwDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
         .map_file = opts.map_file,
         .save_map = opts.save_map,
         .screenshot = opts.screenshot,
+        .initial_zoom = opts.zoom orelse 2.0,
     });
     errdefer app.deinit();
 

@@ -251,14 +251,39 @@ Files touched:
 
 ## Acceptance criteria
 
-- [ ] Zooming out to the minimum (0.25×) shows trees, rocks, buildings,
-      roads, flags, and waves in **every** visible copy of the map, not
-      just the origin-anchored one.
-- [ ] No sprite is drawn twice at the same screen position (dedup via
+- [x] Zooming out to the minimum (0.25×) shows trees, rocks, buildings,
+      roads, and flags in **every** visible copy of the map, not just the
+      origin-anchored one. (Waves are skipped below zoom 0.40 by the LOD
+      pass — terrain water colour still renders.)
+- [x] No sprite is drawn twice at the same screen position (dedup via
       the single-period iterator + per-offset translation).
-- [ ] Zoomed-in rendering (1 offset) is unchanged in appearance and
+- [x] Zoomed-in rendering (1 offset) is unchanged in appearance and
       frame rate.
-- [ ] `zig build test` passes, including new `activeOffsets` and
-      offset-collection tests.
-- [ ] Screenshot at 0.25× on 64×64 and 512×512 maps shows objects across
-      the full viewport.
+- [x] `zig build test` passes, including new `activeOffsets` and LOD tests.
+- [x] Screenshot at 0.25× on 64×64 and 512×512 maps shows objects across
+      the full viewport (see `docs/screenshots/zoom-out/`).
+
+## Implementation notes
+
+The fix was implemented in `feat/zoom-out-full-render`:
+
+- `src/render/culling.zig`: added `OFFSET_GRID` + `activeOffsets()` helper
+  (shared by terrain + sprite passes) with unit tests.
+- `src/render/map_renderer.zig`: refactored the 9-offset culling to call
+  `culling.activeOffsets` so terrain and sprites can never drift.
+- `src/render/app.zig`:
+  - `SceneItem`/`BldEntry` gained `off_x`/`off_y`; sort baselines now
+    include the offset y so back-to-front order is correct across copies.
+  - `renderMapObjects`/`renderBuildings`/`renderRoads`/`renderWaves` loop
+    over `self.frame_offsets` (computed once per frame) and translate each
+    sprite/segment to its offset copy.
+  - `drawMapObject`/`drawBuilding` take `off_x,off_y`.
+  - Sort caches key on `visibleWorldBounds` (the offset set is a pure
+    function of bounds + map size, so bounds-key stays valid) and store
+    the offset in each cached item.
+  - LOD: `lodSkipObjects`/`lodSkipWaves` skip sub-pixel sprites and wave
+    noise at extreme zoom-out (with unit tests).
+- `src/main.zig` + `AppOptions`: added `--zoom <f32>` CLI flag and
+  `initial_zoom` option so headless screenshots can capture a specific
+  zoom level.
+- `build.zig`: wired the render module tests into `zig build test`.

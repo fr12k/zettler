@@ -23,6 +23,7 @@ const core = @import("core");
 const Shader = @import("Shader.zig").Shader;
 const Camera = @import("Camera.zig").Camera;
 const TextureAtlas = @import("texture_atlas.zig").TextureAtlas;
+const culling_mod = @import("culling.zig");
 
 const Map = core.map.Map;
 const MapPos = core.MapPos;
@@ -427,29 +428,14 @@ pub const MapRenderer = struct {
 
         // 3×3 grid of offsets ensures seamless wrapping in all directions.
         // When the camera is near the left/top edge, we need negative offsets
-        // to cover the viewport extending past the wrap seam.
-        const all_offsets = [9][2]f32{
-            .{ -mw, -mh }, .{ 0.0, -mh }, .{ mw, -mh },
-            .{ -mw, 0.0 }, .{ 0.0, 0.0 }, .{ mw, 0.0 },
-            .{ -mw, mh },  .{ 0.0, mh },  .{ mw, mh },
-        };
-
-        // Cull offsets that do not intersect the camera's visible world bounds.
-        // Each offset copy covers [dx, dx+mw) × [dy, dy+mh) in world space.
+        // to cover the viewport extending past the wrap seam. The offset set
+        // is shared with the CPU-side sprite passes via culling.activeOffsets so
+        // terrain and objects always replicate at the same copies.
         const vb = camera.visibleWorldBounds();
         var offsets: [9][2]f32 = undefined;
-        var num_offsets: usize = 0;
-        for (all_offsets) |off| {
-            const ox = off[0];
-            const oy = off[1];
-            // Rectangle [ox, ox+mw) × [oy, oy+mh) vs [vb.min_x, vb.max_x) × [vb.min_y, vb.max_y).
-            const overlaps = ox < vb.max_x and (ox + mw) > vb.min_x and
-                oy < vb.max_y and (oy + mh) > vb.min_y;
-            if (overlaps) {
-                offsets[num_offsets] = off;
-                num_offsets += 1;
-            }
-        }
+        const num_offsets = culling_mod.activeOffsets(
+            vb.min_x, vb.min_y, vb.max_x, vb.max_y, mw, mh, &offsets,
+        );
         const draw_offsets = offsets[0..num_offsets];
 
         camera.updateMatrices();
