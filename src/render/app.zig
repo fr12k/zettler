@@ -76,6 +76,10 @@ pub const AppOptions = struct {
     /// When perf_log is true and this is non-zero, exit after this many frames
     /// (headless perf run). 0 = run until window close.
     perf_frames: u64 = 0,
+    /// Spread buildings across the whole map (corners, edges, center) instead
+    /// of the default center cluster, so zoom-out rendering can be verified at
+    /// every position and every torus offset copy.
+    scatter_buildings: bool = false,
 };
 
 /// A 1x1 white fallback texture for when the real atlas isn't loaded.
@@ -203,6 +207,8 @@ pub const App = struct {
     perf_log: bool = false,
     /// Exit after this many frames when perf_log is on (headless perf run).
     perf_frames: u64 = 0,
+    /// Spread buildings across the whole map for zoom-out render testing.
+    scatter_buildings: bool = false,
     frame_count: u64 = 0,
     fps: f32 = 0,
     frame_times: [60]f64 = @splat(0),
@@ -332,6 +338,7 @@ pub const App = struct {
             .screenshot_exit_frame = screenshot_exit_frame,
             .perf_log = opts.perf_log,
             .perf_frames = opts.perf_frames,
+            .scatter_buildings = opts.scatter_buildings,
         };
     }
 
