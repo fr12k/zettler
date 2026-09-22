@@ -230,6 +230,22 @@ debug build, 1024×768 viewport):
    with no per-offset culling. The base pass is already culled via a
    dynamic index buffer, but the overlay is not.
 
+   **Proof that terrain scales with map size, not viewport:**
+   measured at zoom 1.0 (1 offset, same ~1024×768 world-px viewport for
+   all map sizes), so the base pass (already culled) costs the same
+   (~1ms). The entire difference is the un-culled overlay:
+
+   | map size   | terrain | tiles | scale vs 64² |
+   |------------|---------|-------|--------------|
+   | 64×64      | 1.4ms   | 4K    | 1×           |
+   | 128×128    | 1.9ms   | 16K   | 1.4×         |
+   | 256×256    | 3.6ms   | 65K   | 2.6×         |
+   | 512×512    | 9.7ms   | 262K  | 7×           |
+   | 1024×1024  | 36.0ms  | 1M    | 26×          |
+
+   The terrain cost grows ~linearly with map tile count because the
+   overlay draws ALL boundary tiles on the whole map every frame.
+
 2. **Objects / trees-rocks (14.3ms)** — constant regardless of map size
    (the visible-tile iterator clamps to one period), but scales with
    offset count (9× at zoom 0.25). The cost is per-frame CPU iteration +
@@ -250,6 +266,20 @@ per-offset we need a row-contiguous index layout: restructure the
 overlay so tile (x,y) → overlay vertex range [boundary_index(x,y)*6,
 +6). Then build a dynamic index list per offset containing only the
 visible boundary tiles, exactly like the base pass.
+
+**Does rendering time still scale with map size after Optimization A?**
+
+**No.** After Optimization A, both the base pass AND the overlay pass
+are culled to visible tiles only. The terrain cost becomes ~constant
+(~2-3ms) regardless of map size, because:
+- The base pass is already culled (costs ~1ms regardless of map size).
+- The overlay pass will be culled too (only visible boundary tiles, same
+  ~21K tiles regardless of whether the map is 64² or 1024²).
+- The static VBO upload happens once at map load; per-frame GPU work
+  only processes the visible indices.
+
+Before A: terrain 1.4ms → 36.0ms (26×) as map grows 64² → 1024².
+After A: terrain ~2-3ms for ALL map sizes (constant, viewport-bound).
 
 **Expected gain**: the overlay should drop from ~40ms to ~2-4ms on
 1024² (only visible boundary tiles, ~21K instead of ~500K). Terrain
