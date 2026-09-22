@@ -202,6 +202,176 @@ Planned optimization (separate PR, out of scope for this correctness fix):
 These are performance improvements and do not change the correctness of
 the offset-loop fix.
 
+---
+
+## Future optimization plan: reaching 40+ FPS on big maps
+
+### Current performance baseline
+
+Measured with `--perf --perf-frames` (Xvfb headless, release-equivalent
+debug build, 1024×768 viewport):
+
+| map        | zoom | terrain  | objects  | waves  | roads  | buildings | total      | FPS  |
+|------------|------|----------|----------|--------|--------|-----------|------------|------|
+| 64×64      | 0.25 | 14.5ms   | 13.8ms   | 0.9ms  | 0.9ms  | 0.01ms    | 36.3ms     | 27.5 |
+| 64×64      | 1.0  | 1.4ms    | 1.1ms    | 0.08ms | 0.13ms | 0.01ms    | 6.7ms      | 150  |
+| 512×512    | 0.25 | 20.6ms   | 14.3ms   | 0.9ms  | 0.9ms  | 0.01ms    | 44.1ms     | 23   |
+| 512×512    | 1.0  | 9.7ms    | 1.1ms    | 0.08ms | 0.14ms | 0.01ms    | 14.8ms     | 68   |
+| 512×512    | 2.0  | 8.7ms    | 0.3ms    | 0.03ms | 0.08ms | 0.01ms    | 12.2ms     | 82   |
+| 1024×1024  | 0.25 | 47.4ms   | 14.3ms   | 0.9ms  | 0.9ms  | 0.01ms    | 71.4ms     | 14   |
+| 1024×1024  | 1.0  | 36.6ms   | 1.2ms    | 0.09ms | 0.19ms | 0.01ms    | 42.3ms     | 24   |
+
+**Two bottlenecks dominate on big maps:**
+
+1. **Terrain (20.6ms @ 512², 47.4ms @ 1024²)** — scales with map size,
+   NOT with viewport. Even at zoom 1.0 (1 offset) the 1024² terrain takes
+   36.6ms. The root cause is the **overlay pass**: it draws the FULL
+   overlay VBO (every boundary tile on the entire map) at every offset
+   with no per-offset culling. The base pass is already culled via a
+   dynamic index buffer, but the overlay is not.
+
+2. **Objects / trees-rocks (14.3ms)** — constant regardless of map size
+   (the visible-tile iterator clamps to one period), but scales with
+   offset count (9× at zoom 0.25). The cost is per-frame CPU iteration +
+   collection + sort + batcher submission.
+
+### Optimization A: cull the terrain overlay per-offset (biggest win)
+
+**Problem**: `map_renderer.render` Pass 2 (overlay) binds the full
+overlay VBO/IBO and calls `gl.drawElements` with
+`self.overlay_index_count` (ALL boundary tiles) at every active offset.
+On a 1024² map, boundary tiles can be ~50% of tiles = ~500K triangles,
+drawn 9× = 4.5M offscreen triangles per frame. This is the 47.4ms.
+
+**Fix**: apply the same per-offset dynamic-index culling to the overlay
+that the base pass already uses. The overlay vertices are laid out as
+6 verts / 6 indices per boundary tile (2 triangles × 3 verts). To cull
+per-offset we need a row-contiguous index layout: restructure the
+overlay so tile (x,y) → overlay vertex range [boundary_index(x,y)*6,
++6). Then build a dynamic index list per offset containing only the
+visible boundary tiles, exactly like the base pass.
+
+**Expected gain**: the overlay should drop from ~40ms to ~2-4ms on
+1024² (only visible boundary tiles, ~21K instead of ~500K). Terrain
+total should drop from 47.4ms to ~10ms, bringing 1024² zoom 0.25 from
+71ms to ~34ms (29 FPS), and 1024² zoom 1.0 from 42ms to ~16ms (62 FPS).
+
+**Files**: `src/render/map_renderer.zig` — restructure overlay VBO build
+to be row-contiguous, add per-offset dynamic index culling in Pass 2.
+Add a `dyn_overlay_ibo` + `dyn_overlay_indices` buffer.
+
+**Complexity**: medium. The overlay is currently append-only (boundary
+tiles only); making it row-contiguous requires a mapping from tile
+index → overlay vertex offset, or a separate index array that
+references the base tile's overlay verts by tile index.
+
+### Optimization B: static object VBO for trees/rocks (14.3ms → ~0)
+
+**Problem**: `renderMapObjects` iterates every visible tile × 9 offsets,
+collects tiles with objects into a `SceneItem` array, sorts by baseline,
+and submits each sprite to the batcher per frame. Trees and rocks do not
+move unless harvested — this is pure per-frame overhead.
+
+**Fix**: build a static VBO of all tree/rock sprites (shadow + sprite
+quad = 2 quads = 8 vertices each) once at atlas-build time. Store vertex
+positions in world space (like the terrain VBO). Draw at the 9 offsets
+with the same `setOffset` uniform the terrain uses. Rebuild only when a
+tile's object changes (harvest, growth) — track a dirty flag per tile or
+a global "objects dirty" counter.
+
+The sort (back-to-front by baseline) is only needed for correct
+occlusion between objects at different heights. With a static VBO the
+sort is done once at build time — vertices are emitted in sorted order.
+When an object is removed (harvested), mark the VBO dirty and rebuild.
+
+**Expected gain**: objects pass drops from 14.3ms to ~1-2ms (just 9
+GPU draw calls with the static VBO, no CPU iteration/sort). Brings
+512² zoom 0.25 from 44ms to ~31ms (32 FPS), 1024² zoom 0.25 from 71ms
+to ~57ms (but with optimization A applied too, ~24ms = 42 FPS).
+
+**Files**: `src/render/map_renderer.zig` or a new `object_renderer.zig`
+— add `ObjectRenderer` with `rebuild(map, atlas)`, `render(camera)`,
+and a `markDirty(tile)` method. `app.zig` calls `rebuild` at atlas load
+and on harvest events, `render` each frame instead of
+`renderMapObjects`.
+
+**Complexity**: medium-high. Needs sprite-to-vertex conversion (atlas
+UV → vertex UV), a dirty-tracking mechanism, and integration with the
+harvest/game-logic layer. The shadow sprite (sprite_id + 250) must also
+be baked in.
+
+### Optimization C: static building VBO (0.01ms → ~0, negligible)
+
+Buildings are already negligible (0.01ms for 16 buildings). A static VBO
+would eliminate even that, but the gain is not measurable. **Skip unless
+building count grows to hundreds+**. If done, same approach as B:
+bake building sprites into a static VBO, rebuild on construct/demolish.
+
+### Optimization D: instanced rendering for the offset grid (future)
+
+**Problem**: both terrain and (with B) objects draw the same VBO 9× with
+different `u_offset` uniforms — 9 separate `gl.drawElements` calls per
+pass. At zoom 0.25 all 9 offsets are active.
+
+**Fix**: use OpenGL instancing (`gl.drawElementsInstanced` with
+`gl_InstanceID` → offset index in the shader) to draw all 9 offset
+copies in a single draw call. Pass the 9 offsets as a uniform array and
+select by `gl_InstanceID`. The per-offset visibility cull still happens
+CPU-side (only enable the visible instances).
+
+**Expected gain**: reduces draw calls from 9→1 per pass. Draw-call
+overhead is ~0.01ms each on modern GPUs, so this saves <0.1ms. **Not
+worth it unless profiling shows draw-call overhead is significant.**
+
+### Optimization E: wave animation via texture atlas swap (0.9ms → ~0)
+
+Waves are 16 animation frames × water tiles. Currently each water tile
+selects a frame per-tile and submits a sprite quad per frame. A static
+VBO with the tile positions baked in, and the frame selected via a
+uniform (or texture array layer) would eliminate the per-frame CPU work.
+**Low priority** — waves are only 0.9ms.
+
+### Optimization F: road rendering via line VBO (0.9ms → ~0)
+
+Roads are line segments between connected tiles. A static line VBO
+rebuilt when roads change (player builds/demolishes) would eliminate the
+per-frame tile iteration. **Low priority** — roads are only 0.9ms.
+
+### Priority order and expected results
+
+| priority | optimization | effort | expected gain (1024² z0.25) |
+|----------|-------------|--------|-----------------------------|
+| **1** | A: overlay per-offset cull | medium | terrain 47ms→10ms (-37ms) |
+| **2** | B: static object VBO | medium-high | objects 14ms→1.5ms (-12.5ms) |
+| 3 | F: static road VBO | low | roads 0.9ms→0.1ms (-0.8ms) |
+| 4 | E: wave texture swap | low | waves 0.9ms→0.1ms (-0.8ms) |
+| — | C: static building VBO | low | 0.01ms→0 (skip) |
+| — | D: instanced offsets | medium | <0.1ms (skip) |
+
+**With A + B applied** (the two that matter):
+
+| map | zoom | before | after A+B (est.) | FPS |
+|-----|------|--------|-------------------|-----|
+| 512² | 0.25 | 44.1ms (23) | ~12ms | **83** |
+| 512² | 1.0 | 14.8ms (68) | ~6ms | **167** |
+| 1024² | 0.25 | 71.4ms (14) | ~25ms | **40** |
+| 1024² | 1.0 | 42.3ms (24) | ~12ms | **83** |
+
+Optimization A alone gets 1024² zoom 0.25 from 71ms to ~34ms (29 FPS).
+Adding B gets it to ~25ms (40 FPS) — the target.
+
+### Measurement methodology
+
+All estimates are from per-pass timing via `--perf --perf-frames 128` on
+Xvfb (software OpenGL, no GPU acceleration). On real hardware with a
+GPU, the terrain base/overlay GPU draw cost will be lower (hardware
+rasterization), but the CPU-side object iteration (14.3ms) is
+GPU-independent and will be the same. The overlay culling (A) and static
+object VBO (B) are CPU-side wins that help regardless of GPU.
+
+Re-measure after each optimization with the same `--perf` flags on the
+same map sizes to verify the gains.
+
 ## Implementation phases
 
 ### Phase 1 — Correctness: render all visible copies when zoomed out
