@@ -293,7 +293,7 @@ approach (future PR) is the right fix.
 - [x] Screenshots at 0.25x, 0.5x, 1.0x, 2.0x, and 4.0x on 64x64 and
       512x512 maps with buildings scattered across the whole world show
       objects and buildings across all four viewport quadrants at every
-      zoom level (see `docs/screenshots/zoom-out/phase1-test/`).
+      zoom level (see `.github/pr-assets/zoom-out/`).
 - [x] Full UI (HUD, FPS, minimap) renders correctly at all zoom levels.
 
 ## Implementation notes
