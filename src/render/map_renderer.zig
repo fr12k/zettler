@@ -198,6 +198,22 @@ pub const MapRenderer = struct {
     map_pixel_width: f32 = 0,
     map_pixel_height: f32 = 0,
 
+    // ── Optimization A: per-offset overlay culling ──
+    // Mapping from tile index (y*map_w + x) → the starting vertex offset in
+    // the overlay VBO for that tile's 6 overlay vertices (2 triangles). Set
+    // to OVERLAY_TILE_NONE for non-boundary tiles (no overlay). This lets the
+    // render pass look up a tile's overlay vertices by position and build a
+    // dynamic index list containing only visible boundary tiles — exactly
+    // like the base pass already does. Before this, the overlay drew the
+    // FULL overlay VBO at every offset, which scaled with map size (O(map))
+    // instead of viewport size (O(visible)).
+    overlay_tile_base: []u32 = &.{},
+    // Dynamic IBO + CPU scratch for the per-offset overlay culling.
+    dyn_overlay_ibo: gl.GLuint = 0,
+    dyn_overlay_indices: []u32 = &.{},
+    /// Sentinel for tiles that have no overlay (not a boundary tile).
+    pub const OVERLAY_TILE_NONE: u32 = 0xFFFF_FFFF;
+
     // Terrain vertex (matches Shader.createMaskedTerrain):
     //   position(x,y), ground_local(gl_u,gl_v), ground_region(gr_*),
     //   bary(m_u,m_v) — vertex barycentric for the overlay edge-fade,
@@ -249,6 +265,19 @@ pub const MapRenderer = struct {
             std.heap.page_allocator.free(self.dyn_indices);
             self.dyn_indices = &.{};
         }
+        if (self.dyn_overlay_ibo != 0) {
+            var v = self.dyn_overlay_ibo;
+            gl.deleteBuffers(1, &v);
+            self.dyn_overlay_ibo = 0;
+        }
+        if (self.dyn_overlay_indices.len > 0) {
+            std.heap.page_allocator.free(self.dyn_overlay_indices);
+            self.dyn_overlay_indices = &.{};
+        }
+        if (self.overlay_tile_base.len > 0) {
+            std.heap.page_allocator.free(self.overlay_tile_base);
+            self.overlay_tile_base = &.{};
+        }
         self.shader.deinit();
         self.initialized = false;
     }
@@ -271,6 +300,7 @@ pub const MapRenderer = struct {
         if (self.ibo == 0) self.ibo = gl.genBuffers(1);
         if (self.overlay_vbo == 0) self.overlay_vbo = gl.genBuffers(1);
         if (self.overlay_ibo == 0) self.overlay_ibo = gl.genBuffers(1);
+        if (self.dyn_overlay_ibo == 0) self.dyn_overlay_ibo = gl.genBuffers(1);
 
         // Compute the world-space size of one full map for torus rendering.
         // In isometric projection: the rightmost column is at screen_x = (width-1)*TileWidth
@@ -298,6 +328,13 @@ pub const MapRenderer = struct {
         defer allocator.free(base_i);
         const ov_v = try allocator.alloc(Vertex, num_tiles * 6);
         defer allocator.free(ov_v);
+        // overlay_tile_base: per-tile mapping to the overlay VBO vertex offset.
+        // Allocated/reallocated here; freed in deinit.
+        if (self.overlay_tile_base.len < num_tiles) {
+            if (self.overlay_tile_base.len > 0) allocator.free(self.overlay_tile_base);
+            self.overlay_tile_base = try allocator.alloc(u32, num_tiles);
+        }
+        @memset(self.overlay_tile_base[0..num_tiles], OVERLAY_TILE_NONE);
         const ov_i = try allocator.alloc(u32, num_tiles * 6);
         defer allocator.free(ov_i);
         var ov_vc: usize = 0; // overlay vertex count
@@ -367,6 +404,9 @@ pub const MapRenderer = struct {
                 // ── OVERLAY: only boundary tiles get the dithered transition ──
                 // Uses wrapping-aware boundary check.
                 if (isTerrainBoundaryWrapped(map, x, y)) {
+                    // Record this tile's overlay vertex base offset for per-offset
+                    // culling in render() (Optimization A).
+                    self.overlay_tile_base[ti] = @intCast(ov_vc);
                     var ou: f32 = 0; var ov: f32 = 0; var ouw: f32 = 0; var ovh: f32 = 0;
                     if (atlas) |a| {
                         if (terrainSpriteId(tile.terrain)) |sid| {
@@ -391,6 +431,12 @@ pub const MapRenderer = struct {
         if (self.dyn_indices.len < self.index_count) {
             if (self.dyn_indices.len > 0) std.heap.page_allocator.free(self.dyn_indices);
             self.dyn_indices = std.heap.page_allocator.alloc(u32, self.index_count) catch &.{};
+        }
+        // Allocate the dynamic overlay index scratch buffer (worst case: all
+        // boundary tiles visible). Each boundary tile has 6 overlay indices.
+        if (self.dyn_overlay_indices.len < self.index_count) {
+            if (self.dyn_overlay_indices.len > 0) std.heap.page_allocator.free(self.dyn_overlay_indices);
+            self.dyn_overlay_indices = std.heap.page_allocator.alloc(u32, self.index_count) catch &.{};
         }
         self.overlay_vertex_count = ov_vc;
         self.overlay_index_count = ov_ic;
@@ -520,19 +566,74 @@ pub const MapRenderer = struct {
             }
         }
 
-        // Pass 2: Overlay (boundary tiles only) at the visible offsets.
-        // The overlay VBO is smaller (only boundary tiles) and its index
-        // layout is not row-contiguous, so we draw the full overlay for now.
-        // If this becomes a bottleneck, the overlay can be restructured into
-        // a row-contiguous layout and culled the same way as the base pass.
-        if (self.overlay_index_count > 0) {
+        // Pass 2: Overlay (boundary tiles only) with per-offset culling.
+        // Optimization A: instead of drawing the full overlay VBO at every
+        // offset (which scales with map size), we build a dynamic index list
+        // per offset containing only the visible boundary tiles' overlay
+        // indices — exactly like the base pass. The overlay_tile_base mapping
+        // (tile index → overlay vertex offset) lets us look up each visible
+        // tile's 6 overlay indices by position.
+        if (self.overlay_index_count > 0 and self.overlay_tile_base.len > 0) {
             self.shader.setUseMask(1);
             gl.bindBuffer(gl.GL_ARRAY_BUFFER, self.overlay_vbo);
             bindTerrainAttribs(stride);
-            gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.overlay_ibo);
+            gl.bindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.dyn_overlay_ibo);
+            const odi = self.dyn_overlay_indices;
+            const otb = self.overlay_tile_base;
+
             for (draw_offsets) |off| {
                 self.shader.setOffset(off[0], off[1]);
-                gl.drawElements(gl.GL_TRIANGLES, @intCast(self.overlay_index_count), gl.GL_UNSIGNED_INT, 0);
+
+                // Visible row range for this offset (same as base pass).
+                const row_lo_f = (vb.min_y - off[1]) / TileHeight;
+                const row_hi_f = (vb.max_y - off[1]) / TileHeight;
+                var row_lo: i32 = @as(i32, @intFromFloat(@floor(row_lo_f))) - tile_margin;
+                var row_hi: i32 = @as(i32, @intFromFloat(@ceil(row_hi_f))) + tile_margin;
+                if (row_lo < 0) row_lo = 0;
+                if (row_hi >= @as(i32, @intCast(map_h))) row_hi = @as(i32, @intCast(map_h)) - 1;
+                if (row_lo > row_hi) continue;
+
+                // Build the dynamic overlay index list for visible boundary
+                // tiles in this offset.
+                var dyn_count: usize = 0;
+                var y_s: i32 = row_lo;
+                while (y_s <= row_hi) : (y_s += 1) {
+                    const y: u32 = @intCast(y_s);
+                    const shear = @as(f32, @floatFromInt(y)) * hw;
+                    const col_lo_f = (vb.min_x - off[0] + shear) / TileWidth;
+                    const col_hi_f = (vb.max_x - off[0] + shear) / TileWidth;
+                    var col_lo: i32 = @as(i32, @intFromFloat(@floor(col_lo_f))) - tile_margin;
+                    var col_hi: i32 = @as(i32, @intFromFloat(@ceil(col_hi_f))) + tile_margin;
+                    if (col_lo < 0) col_lo = 0;
+                    if (col_hi >= @as(i32, @intCast(map_w))) col_hi = @as(i32, @intCast(map_w)) - 1;
+                    if (col_lo > col_hi) continue;
+
+                    var x_s: i32 = col_lo;
+                    while (x_s <= col_hi) : (x_s += 1) {
+                        const ti: u32 = y * map_w + @as(u32, @intCast(x_s));
+                        if (ti >= otb.len) continue;
+                        const base = otb[ti];
+                        if (base == OVERLAY_TILE_NONE) continue; // not a boundary tile
+                        // Each boundary tile has 6 overlay vertices: 2 triangles
+                        // (UP: P,Dn,DR and DOWN: P,R,DR), laid out as
+                        // [base+0..base+3) = UP tri, [base+3..base+6) = DOWN tri.
+                        if (dyn_count + 6 > odi.len) break;
+                        odi[dyn_count + 0] = base + 0;
+                        odi[dyn_count + 1] = base + 1;
+                        odi[dyn_count + 2] = base + 2;
+                        odi[dyn_count + 3] = base + 3;
+                        odi[dyn_count + 4] = base + 4;
+                        odi[dyn_count + 5] = base + 5;
+                        dyn_count += 6;
+                    }
+                }
+
+                if (dyn_count > 0) {
+                    const byte_len = dyn_count * @sizeOf(u32);
+                    const byte_slice: []const u8 = @as([*]const u8, @ptrCast(odi.ptr))[0..byte_len];
+                    gl.bufferData(gl.GL_ELEMENT_ARRAY_BUFFER, byte_slice, gl.GL_DYNAMIC_DRAW);
+                    gl.drawElements(gl.GL_TRIANGLES, @intCast(dyn_count), gl.GL_UNSIGNED_INT, 0);
+                }
             }
         }
 

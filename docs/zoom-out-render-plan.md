@@ -286,14 +286,32 @@ After A: terrain ~2-3ms for ALL map sizes (constant, viewport-bound).
 total should drop from 47.4ms to ~10ms, bringing 1024² zoom 0.25 from
 71ms to ~34ms (29 FPS), and 1024² zoom 1.0 from 42ms to ~16ms (62 FPS).
 
-**Files**: `src/render/map_renderer.zig` — restructure overlay VBO build
-to be row-contiguous, add per-offset dynamic index culling in Pass 2.
-Add a `dyn_overlay_ibo` + `dyn_overlay_indices` buffer.
+**IMPLEMENTED and MEASURED** (commit on `feat/zoom-out-full-render`):
 
-**Complexity**: medium. The overlay is currently append-only (boundary
-tiles only); making it row-contiguous requires a mapping from tile
-index → overlay vertex offset, or a separate index array that
-references the base tile's overlay verts by tile index.
+| map        | zoom | terrain before | terrain after | total before | total after | FPS before | FPS after |
+|------------|------|-----------------|---------------|--------------|-------------|------------|-----------|
+| 64×64      | 1.0  | 1.4ms           | 1.4ms         | 6.7ms        | 6.5ms       | 150        | 154       |
+| 256×256    | 1.0  | 3.6ms           | 1.3ms         | 8.6ms        | 6.4ms       | 116        | 155       |
+| 512×512    | 1.0  | 9.7ms           | 1.2ms         | 14.8ms       | 6.3ms       | 68         | **160**   |
+| 512×512    | 0.25 | 20.6ms          | 13.4ms        | 44.1ms       | 37.0ms      | 23         | 27        |
+| 1024×1024  | 1.0  | 36.6ms          | 1.3ms         | 42.3ms       | 6.7ms       | 24         | **150**   |
+| 1024×1024  | 0.25 | 47.4ms          | 13.9ms        | 71.4ms       | 37.9ms      | 14         | 26        |
+
+Terrain cost is now **constant regardless of map size** (~1.3ms at zoom
+1.0, ~13.5ms at zoom 0.25 for all map sizes 64²–1024²). The 1024² map at
+zoom 1.0 went from 42ms (24 FPS) to 6.7ms (**150 FPS**) — a 6.3×
+improvement. The prediction was accurate: terrain dropped from ~40ms to
+~14ms at zoom 0.25 (slightly more than the ~10ms predicted, because the
+base pass also benefits from the same per-offset culling at 9 offsets).
+
+The remaining bottleneck at zoom 0.25 is now **objects (14.3ms)** —
+that is Optimization B (static object VBO).
+
+**Files**: `src/render/map_renderer.zig` — added `overlay_tile_base`
+mapping (tile index → overlay vertex offset), `dyn_overlay_ibo` +
+`dyn_overlay_indices` scratch buffer. Pass 2 now builds a dynamic index
+list per offset containing only visible boundary tiles' overlay indices,
+exactly like the base pass.
 
 ### Optimization B: static object VBO for trees/rocks (14.3ms → ~0)
 
