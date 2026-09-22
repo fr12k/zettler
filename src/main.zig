@@ -41,6 +41,13 @@ const CliOptions = struct {
     map_file: ?[]const u8 = null,
     save_map: ?[]const u8 = null,
     screenshot: ?[]const u8 = null,
+    zoom: ?f32 = null,
+    perf: bool = false,
+    perf_frames: u64 = 0,
+    /// Spread buildings across the whole map (corners, edges, center) instead
+    /// of the default center cluster, so zoom-out rendering can be verified at
+    /// every position and every torus offset copy.
+    scatter_buildings: bool = false,
     help: bool = false,
 };
 
@@ -87,6 +94,16 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !CliOptions {
             opts.save_map = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--screenshot")) {
             opts.screenshot = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--zoom")) {
+            const val = it.next() orelse return error.MissingValue;
+            opts.zoom = std.fmt.parseFloat(f32, val) catch return error.InvalidSeed;
+        } else if (std.mem.eql(u8, arg, "--perf")) {
+            opts.perf = true;
+        } else if (std.mem.eql(u8, arg, "--perf-frames")) {
+            const val = it.next() orelse return error.MissingValue;
+            opts.perf_frames = std.fmt.parseInt(u64, val, 10) catch return error.InvalidSeed;
+        } else if (std.mem.eql(u8, arg, "--scatter-buildings")) {
+            opts.scatter_buildings = true;
         } else if (std.mem.eql(u8, arg, "--map-size")) {
             // Parse both values into temporaries and only commit to `opts`
             // when both succeed, so a bad height does not leave a lopsided
@@ -204,6 +221,14 @@ fn printUsage() void {
         \\                       be replayed later with --map-file.
         \\  --screenshot <path>  Render N frames then write a BMP screenshot
         \\                       to this path and exit (headless capture).
+        \\  --zoom <f32>          Set the initial camera zoom (default 2.0;
+        \\                       min 0.25). Useful with --screenshot to capture
+        \\                       a zoomed-out view.
+        \\  --perf                Record per-frame render time and print a
+        \\                       summary at exit (min/avg/p95/max/FPS + per-pass).
+        \\  --perf-frames <N>     Exit after N frames (headless perf run).
+        \\  --scatter-buildings   Spread buildings across the whole map instead
+        \\                       of a center cluster (for zoom-out testing).
         \\  -h, --help            Show this help and exit.
         \\
         \\Map sizes from {d}x{d} to {d}x{d} are supported.
@@ -248,6 +273,10 @@ fn runGlfwDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
         .map_file = opts.map_file,
         .save_map = opts.save_map,
         .screenshot = opts.screenshot,
+        .initial_zoom = opts.zoom orelse 2.0,
+        .perf_log = opts.perf,
+        .perf_frames = opts.perf_frames,
+        .scatter_buildings = opts.scatter_buildings,
     });
     errdefer app.deinit();
 
@@ -292,26 +321,62 @@ fn setupDemoScene(app: *App) !void {
     const cy: u16 = app.game.state.map.height / 2;
     const game = &app.game;
 
-    const positions = [_]MapPos{
-        .{ .x = cx + 3, .y = cy },
-        .{ .x = cx, .y = cy + 3 },
-        .{ .x = cx, .y = cy },
-        .{ .x = cx + 2, .y = cy + 2 },
-        .{ .x = cx - 3, .y = cy },
-        .{ .x = cx + 1, .y = cy - 2 },
-        .{ .x = cx - 2, .y = cy + 1 },
-        .{ .x = cx + 2, .y = cy - 1 },
-        .{ .x = cx - 1, .y = cy + 2 },
-    };
-    for (positions) |pos| {
-        game.state.map.getTile(pos).terrain = .grass;
-    }
-
     const building_types = [_]Building{
         .lumberjack, .fisher,     .stock,
         .sawmill,    .forester,   .farm,
         .tower,      .stonecutter, .mill,
     };
+
+    var positions: []const MapPos = &.{};
+    var scatter_buf: [16]MapPos = undefined;
+
+    if (app.scatter_buildings) {
+        // Spread buildings across the whole map: corners, edge midpoints,
+        // center, and quarter positions. This verifies that every building
+        // renders at every zoom level and in every torus offset copy when
+        // zoomed out. Flatten terrain to grass so all are placeable.
+        const w: u16 = app.game.state.map.width;
+        const h: u16 = app.game.state.map.height;
+        const qx: u16 = w / 4;
+        const qy: u16 = h / 4;
+        scatter_buf = .{
+            .{ .x = 4, .y = 4 },           // top-left corner
+            .{ .x = w - 5, .y = 4 },        // top-right corner
+            .{ .x = 4, .y = h - 5 },        // bottom-left corner
+            .{ .x = w - 5, .y = h - 5 },    // bottom-right corner
+            .{ .x = cx, .y = cy },          // center
+            .{ .x = cx, .y = 4 },           // top edge midpoint
+            .{ .x = cx, .y = h - 5 },       // bottom edge midpoint
+            .{ .x = 4, .y = cy },           // left edge midpoint
+            .{ .x = w - 5, .y = cy },       // right edge midpoint
+            .{ .x = qx, .y = qy },          // top-left quarter
+            .{ .x = w - qx - 1, .y = qy },  // top-right quarter
+            .{ .x = qx, .y = h - qy - 1 },  // bottom-left quarter
+            .{ .x = w - qx - 1, .y = h - qy - 1 }, // bottom-right quarter
+            .{ .x = cx + 3, .y = cy },      // near center offsets
+            .{ .x = cx - 3, .y = cy },
+            .{ .x = cx, .y = cy + 3 },
+        };
+        positions = scatter_buf[0..];
+        std.debug.print("  Scene: {} buildings (scattered across map)\n", .{positions.len});
+    } else {
+        const default_positions = [_]MapPos{
+            .{ .x = cx + 3, .y = cy },
+            .{ .x = cx, .y = cy + 3 },
+            .{ .x = cx, .y = cy },
+            .{ .x = cx + 2, .y = cy + 2 },
+            .{ .x = cx - 3, .y = cy },
+            .{ .x = cx + 1, .y = cy - 2 },
+            .{ .x = cx - 2, .y = cy + 1 },
+            .{ .x = cx + 2, .y = cy - 1 },
+            .{ .x = cx - 1, .y = cy + 2 },
+        };
+        positions = &default_positions;
+    }
+
+    for (positions) |pos| {
+        game.state.map.getTile(pos).terrain = .grass;
+    }
 
     for (building_types, 0..) |btype, i| {
         if (i < positions.len) {
@@ -334,7 +399,9 @@ fn setupDemoScene(app: *App) !void {
     p.resources[@intFromEnum(Resource.coal)] = 3;
     p.resources[@intFromEnum(Resource.beer)] = 2;
 
-    std.debug.print("  Scene: {} buildings\n", .{building_types.len});
+    if (!app.scatter_buildings) {
+        std.debug.print("  Scene: {} buildings\n", .{building_types.len});
+    }
 }
 
 fn runTerminalDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {

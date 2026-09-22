@@ -141,7 +141,72 @@ pub fn visibleTiles(
     };
 }
 
+/// The 3×3 torus offset grid (world-space deltas). Each copy of the map is
+/// drawn at one of these offsets so the world appears seamless/infinite. Must
+/// match `map_renderer.render`'s `all_offsets` table.
+pub const OFFSET_GRID: [9][2]f32 = .{
+    .{ -1, -1 }, .{ 0, -1 }, .{ 1, -1 },
+    .{ -1, 0 }, .{ 0, 0 }, .{ 1, 0 },
+    .{ -1, 1 }, .{ 0, 1 }, .{ 1, 1 },
+};
+
+/// Compute the world-space offset copies of the map that intersect the given
+/// visible rectangle. `map_pixel_w`/`map_pixel_h` are the world-space size of
+/// one full map period (width*TileWidth, height*TileHeight). Each offset copy
+/// covers `[ox*mpw, ox*mpw+mpw) × [oy*mph, oy*mph+mph)`. Returns up to 9
+/// absolute pixel offsets in `out`; the count is returned. `out` must have room
+/// for at least 9 entries. This mirrors the culling done in
+/// `map_renderer.render` so the CPU-side sprite passes replicate objects at the
+/// same offset copies the terrain renderer draws.
+pub fn activeOffsets(
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    map_pixel_w: f32,
+    map_pixel_h: f32,
+    out: *[9][2]f32,
+) usize {
+    if (map_pixel_w <= 0 or map_pixel_h <= 0) return 0;
+    var n: usize = 0;
+    for (OFFSET_GRID) |g| {
+        const ox = g[0] * map_pixel_w;
+        const oy = g[1] * map_pixel_h;
+        // Rectangle [ox, ox+mpw) × [oy, oy+mph) vs [min_x, max_x) × [min_y, max_y).
+        const overlaps = ox < max_x and (ox + map_pixel_w) > min_x and
+            oy < max_y and (oy + map_pixel_h) > min_y;
+        if (overlaps) {
+            out[n] = .{ ox, oy };
+            n += 1;
+        }
+    }
+    return n;
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────
+
+test "activeOffsets returns 1 when viewport is smaller than one map" {
+    var out: [9][2]f32 = undefined;
+    // 64×64 map → 64*32=2048 px wide, 64*20=1280 px tall. Viewport 800×600.
+    const n = activeOffsets(-400, -300, 400, 300, 2048, 1280, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(f32, 0), out[0][0]);
+    try std.testing.expectEqual(@as(f32, 0), out[0][1]);
+}
+
+test "activeOffsets returns 9 when viewport spans multiple periods" {
+    var out: [9][2]f32 = undefined;
+    // Viewport much larger than one 64×64 map period → all 9 copies visible.
+    const n = activeOffsets(-10000, -10000, 10000, 10000, 2048, 1280, &out);
+    try std.testing.expectEqual(@as(usize, 9), n);
+}
+
+test "activeOffsets returns 4-6 when viewport is slightly larger than one map" {
+    var out: [9][2]f32 = undefined;
+    // Viewport a bit larger than one period in +x/+y direction from origin.
+    const n = activeOffsets(0, 0, 3000, 2000, 2048, 1280, &out);
+    try std.testing.expect(n >= 4 and n <= 6);
+}
 
 test "visibleTiles covers a centered view on a 64x64 map" {
     var map = try Map.init(std.testing.allocator, 64, 64);
