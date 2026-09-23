@@ -29,6 +29,8 @@ pub const FlagState = struct {
     next: [6]GameObjectIndex = @splat(GameObjectIndex.invalid),
     /// Length (in map positions) of the road segment in each direction.
     length: [6]u8 = @splat(0),
+    /// Whether the road segment in each direction is a water road (boat).
+    water: [6]bool = @splat(false),
 
     // --- Transport queues ---
     /// Incoming resource queue (resources waiting at the flag).

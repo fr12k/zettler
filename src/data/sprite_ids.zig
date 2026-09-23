@@ -170,3 +170,34 @@ pub const Font = struct {
 };
 
 const core = @import("core");
+
+/// Road/path sprites (AssetPathMask + AssetPathGround).
+/// AssetPathMask base = PAK 230 (mask type, 16 entries: road-shape stencils
+///   per slope/direction, 32×5..32×37). Used as 1-bit alpha masks.
+/// AssetPathGround base = PAK 300 (solid type, 9 entries: 32×20, road surface
+///   textures: grass/desert/snow × steep/gentle/flat + water).
+/// These are the freeserf `path_mask` (data-source-dos.cc:64) and
+/// `path_ground` (data-source-dos.cc:66) asset bases.
+pub const Path = struct {
+    /// PAK base index for path mask sprites (230-245).
+    pub const MASK_BASE: u16 = 230;
+    pub const MASK_COUNT: u16 = 16;
+    /// PAK base index for path ground sprites (300-308).
+    pub const GROUND_BASE: u16 = 300;
+    pub const GROUND_COUNT: u16 = 9;
+
+    /// Ground sprite indices within AssetPathGround:
+    ///   0-2 = grass (steep/gentle/flat), 3-5 = desert, 6-8 = snow.
+    ///   Water road = index 9 (but only 9 sprites in PAK 300-308, so water
+    ///   uses ground sprite 0 with a different mask — matches freeserf which
+    ///   uses sprite 9 as a special case but falls back to ground 0).
+    pub const GROUND_GRASS_FLAT: u16 = 2;
+    pub const GROUND_GRASS_GENTLE: u16 = 1;
+    pub const GROUND_GRASS_STEEP: u16 = 0;
+    pub const GROUND_DESERT_FLAT: u16 = 5;
+    pub const GROUND_DESERT_GENTLE: u16 = 4;
+    pub const GROUND_DESERT_STEEP: u16 = 3;
+    pub const GROUND_SNOW_FLAT: u16 = 8;
+    pub const GROUND_SNOW_GENTLE: u16 = 7;
+    pub const GROUND_SNOW_STEEP: u16 = 6;
+};

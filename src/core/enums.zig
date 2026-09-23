@@ -34,17 +34,17 @@ pub const Direction = enum(u3) {
 
     /// Return the opposite direction.
     pub fn opposite(self: Direction) Direction {
-        return @as(Direction, @enumFromInt((@intFromEnum(self) + 3) % 6));
+        return @as(Direction, @enumFromInt((@as(u8, @intFromEnum(self)) + 3) % 6));
     }
 
     /// Return the direction turned 60 degrees clockwise.
     pub fn clockwise(self: Direction) Direction {
-        return @as(Direction, @enumFromInt((@intFromEnum(self) + 1) % 6));
+        return @as(Direction, @enumFromInt((@as(u8, @intFromEnum(self)) + 1) % 6));
     }
 
     /// Return the direction turned 60 degrees counter-clockwise.
     pub fn counterClockwise(self: Direction) Direction {
-        return @as(Direction, @enumFromInt((@intFromEnum(self) + 5) % 6));
+        return @as(Direction, @enumFromInt((@as(u8, @intFromEnum(self)) + 5) % 6));
     }
 };
 

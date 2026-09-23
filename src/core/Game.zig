@@ -852,11 +852,46 @@ pub const Game = struct {
         return idx;
     }
 
+    /// Validate a whole road from `from` along `path` and classify it as
+    /// water vs ground. Returns `null` if invalid, or `{ dest, water_path }`
+    /// if valid. Ports freeserf `Game::can_build_road` (game.cc:806).
+    pub const RoadValidation = struct { water_path: bool };
+    pub fn canBuildRoad(self: *Game, from: MapPos, path: []const u8) ?RoadValidation {
+        const map = &self.state.map;
+        if (path.len == 0) return null;
+        const ftile = map.getTile(from);
+        if (!ftile.has_flag) return null;
+
+        var p = from;
+        var has_water = false;
+        var has_ground = false;
+        for (path, 0..) |d, i| {
+            if (d >= Direction.count) return null;
+            const dir: Direction = @enumFromInt(d);
+            p = map.getNeighborWrapped(p, dir);
+            const tile = map.getTile(p);
+            // Only the final destination may have a flag (no mid-road flags).
+            if (i < path.len - 1 and tile.has_flag) return null;
+            if (tile.has_building) return null;
+            // Water/ground classification: flag tiles are endpoints and their
+            // terrain type shouldn't cause a mixed water/ground rejection.
+            if (!tile.has_flag) {
+                if (tile.terrain.isWater()) has_water = true else has_ground = true;
+            }
+        }
+        // A road can't mix land and water.
+        if (has_water and has_ground) return null;
+        // Destination must be a flag.
+        if (!map.getTile(p).has_flag) return null;
+
+        return .{ .water_path = has_water };
+    }
+
     /// Build a road between two existing flags along `path` (a list of direction
-    /// steps leaving `from`). Marks the intermediate tiles as road and links the
-    /// two flags in the flag graph. Returns false if the endpoints aren't flags
-    /// or the path doesn't connect them. (Simplified: no wood cost, no per-tile
-    /// passability re-check beyond "not a building".)
+    /// steps leaving `from`). Sets the per-tile `paths` bitmask for every
+    /// segment (both endpoints get a bit) and links the two flags in the flag
+    /// graph. Returns false if the endpoints aren't flags, the path doesn't
+    /// connect them, or the road is invalid (mixed water/ground, mid-road flag).
     pub fn buildRoad(self: *Game, from: MapPos, to: MapPos, path: []const u8) bool {
         const map = &self.state.map;
         if (path.len == 0) return false;
@@ -864,21 +899,24 @@ pub const Game = struct {
         const ttile = map.getTile(to);
         if (!ftile.has_flag or !ttile.has_flag) return false;
 
-        // Validate the path connects from→to and isn't blocked, before mutating.
-        // Uses wrapping so roads can wrap across map edges.
+        // Validate the road (connectivity, no buildings, water/ground classification).
+        const validation = self.canBuildRoad(from, path) orelse return false;
+
+        // Verify the path ends at `to`.
         var p = from;
-        for (path, 0..) |d, i| {
-            if (d >= Direction.count) return false;
+        for (path) |d| {
             p = map.wrapPos(p.move(@enumFromInt(d)));
-            if (i < path.len - 1 and map.getTile(p).has_building) return false;
         }
         if (!p.eql(to)) return false;
 
-        // Mark intermediate tiles as road.
+        // Set the path bits for every segment (both endpoints get a bit).
         p = from;
-        for (path, 0..) |d, i| {
-            p = map.wrapPos(p.move(@enumFromInt(d)));
-            if (i < path.len - 1) map.getTile(p).has_road = true;
+        for (path) |d| {
+            const dir: Direction = @enumFromInt(d);
+            const nb = map.getNeighborWrapped(p, dir);
+            map.addPath(p, dir);
+            map.addPath(nb, dir.opposite());
+            p = map.wrapPos(p.move(dir));
         }
 
         // Link the two flags in the graph (both directions).
@@ -890,8 +928,10 @@ pub const Game = struct {
             const seg_len: u8 = @intCast(@min(path.len, 255));
             self.state.flags.get(from_idx).next[first_dir] = to_idx;
             self.state.flags.get(from_idx).length[first_dir] = seg_len;
+            self.state.flags.get(from_idx).water[first_dir] = validation.water_path;
             self.state.flags.get(to_idx).next[@intFromEnum(back_dir)] = from_idx;
             self.state.flags.get(to_idx).length[@intFromEnum(back_dir)] = seg_len;
+            self.state.flags.get(to_idx).water[@intFromEnum(back_dir)] = validation.water_path;
         }
         return true;
     }
@@ -987,7 +1027,15 @@ test "buildRoad links two flags and marks the path" {
     _ = try game.placeFlag(b, 0);
     const path = [_]u8{ @intFromEnum(Direction.right), @intFromEnum(Direction.right) };
     try std.testing.expect(game.buildRoad(a, b, &path));
-    try std.testing.expect(game.state.map.getTile(.{ .x = 5, .y = 4 }).has_road);
+    // The intermediate tile (5,4) should have path bits set in both right
+    // (toward b) and left (toward a) directions.
+    const mid = game.state.map.getTile(.{ .x = 5, .y = 4 });
+    try std.testing.expect(mid.hasRoad());
+    try std.testing.expect(mid.hasPath(.right));
+    try std.testing.expect(mid.hasPath(.left));
+    // The flag tiles should have path bits toward each other along the road.
+    try std.testing.expect(game.state.map.hasPath(a, .right));
+    try std.testing.expect(game.state.map.hasPath(b, .left));
 }
 
 test "Processing building consumes input and produces output" {

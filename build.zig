@@ -131,6 +131,43 @@ pub fn build(b: *std.Build) void {
     const scan_step = b.step("scan-sprites", "Scan SPAE.PA sprite dimensions");
     scan_step.dependOn(&scan_run.step);
 
+    // Dump the construction-related AssetMapObject sprite entries (PLAN,
+    // corner stone, scaffold frames) from SPAE.PA — reveals which slots are
+    // empty in this data file (e.g. 0x91 corner stone, 0xc1 stock frame).
+    const dump_constr_exe = b.addExecutable(.{
+        .name = "dump-construction",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/dump_construction.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "data", .module = data_mod },
+            },
+        }),
+    });
+    dump_constr_exe.root_module.link_libc = true;
+    const dump_constr_run = b.addRunArtifact(dump_constr_exe);
+    const dump_constr_step = b.step("dump-construction", "Dump construction sprite entries from SPAE.PA");
+    dump_constr_step.dependOn(&dump_constr_run.step);
+
+    // Dump road/path sprite entries (AssetPathMask PAK 230-245, AssetPathGround
+    // PAK 300-308) from SPAE.PA to verify they exist and have valid dimensions.
+    const dump_road_exe = b.addExecutable(.{
+        .name = "dump-road-sprites",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/check_road_sprites.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "data", .module = data_mod },
+            },
+        }),
+    });
+    dump_road_exe.root_module.link_libc = true;
+    const dump_road_run = b.addRunArtifact(dump_road_exe);
+    const dump_road_step = b.step("dump-road-sprites", "Dump road/path sprite entries from SPAE.PA");
+    dump_road_step.dependOn(&dump_road_run.step);
+
     // Check sprite IDs against C++ freeserf map_building_sprite
     const check_ids_exe = b.addExecutable(.{
         .name = "check-ids",
