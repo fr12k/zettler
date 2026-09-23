@@ -1291,17 +1291,42 @@ pub const App = struct {
         return .{ .mask = mask, .ground = ground };
     }
 
+    /// Road color for a given direction and height difference.
+    /// Each direction gets a distinct hue so roads look different depending
+    /// on whether they go right, down-right, or down. Slope (h_diff) modulates
+    /// brightness: uphill = lighter, downhill = darker, flat = base.
+    fn roadColor(dir: core.Direction, h_diff: i32) [4]f32 {
+        const base: [3]f32 = switch (dir) {
+            .right =>      .{ 0.72, 0.56, 0.36 }, // warm brown (horizontal)
+            .down_right => .{ 0.65, 0.50, 0.30 }, // darker brown (diagonal)
+            .down =>       .{ 0.78, 0.60, 0.40 }, // lighter brown (vertical)
+            else =>        .{ 0.72, 0.56, 0.36 },
+        };
+        // Slope modulation: lighten for uphill (h_diff > 0), darken for downhill.
+        const slope_factor: f32 = @as(f32, @floatFromInt(@max(-4, @min(4, h_diff)))) * 0.03;
+        return .{
+            @max(0.1, @min(1.0, base[0] + slope_factor)),
+            @max(0.1, @min(1.0, base[1] + slope_factor)),
+            @max(0.1, @min(1.0, base[2] + slope_factor)),
+            1.0,
+        };
+    }
+
     /// Draw a single road segment from `pos` in direction `dir`, at the given
     /// torus offset. Uses colored lines between tile centers for guaranteed
-    /// connectivity, with a road-brown color matching the original game's roads.
+    /// connectivity, with per-direction and per-slope color variation so roads
+    /// look different depending on which way they go and whether they go
+    /// uphill or downhill.
     fn drawRoadSegment(self: *App, batcher: *SpriteBatcher, pos: core.MapPos, dir: core.Direction, off_x: f32, off_y: f32) void {
         const map = &self.game.state.map;
         const c0 = self.tileCenter(pos);
         const nb = map.getNeighborWrapped(pos, dir);
         const c1 = self.tileCenter(nb);
-        // Road color: warm brown, matching the original Settlers road texture.
-        addLine(batcher, c0[0] + off_x, c0[1] + off_y, c1[0] + off_x, c1[1] + off_y, 5.0,
-            .{ 0.72, 0.56, 0.36, 1.0 });
+        const h1: i32 = @intCast(map.getHeight(pos));
+        const h2: i32 = @intCast(map.getHeight(nb));
+        const h_diff = h1 - h2;
+        const col = roadColor(dir, h_diff);
+        addLine(batcher, c0[0] + off_x, c0[1] + off_y, c1[0] + off_x, c1[1] + off_y, 5.0, col);
     }
 
     /// Draw roads (sprite-based segments from the 6-bit paths bitmask), flag
