@@ -238,61 +238,61 @@ patterns (build.zig steps, `tools/` inspection exes, `src/core/` + `src/render/`
 
 **Files:** `src/core/Map.zig`, `src/core/types.zig` (none), all callers.
 
-- [ ] Add `paths: u6 = 0` to `Tile` (replace `has_road: bool`).
+- [x] Add `paths: u6 = 0` to `Tile` (replace `has_road: bool`).
       Keep a computed `hasRoad()` helper: `paths != 0`.
-- [ ] Add `Map.hasPath(pos, dir)`, `addPath(pos, dir)`, `delPath(pos, dir)`,
+- [x] Add `Map.hasPath(pos, dir)`, `addPath(pos, dir)`, `delPath(pos, dir)`,
       `paths(pos)` mirroring freeserf. Bit index = `@intFromEnum(dir)`.
-- [ ] Add `Map.isRoadSegmentValid(pos, dir)` porting the 4 rules from
+- [x] Add `Map.isRoadSegmentValid(pos, dir)` porting the 4 rules from
       `map.cc:572` (dest paths empty unless flag; passable space; same owner;
       water-continuity). Needs `Map.spaceFromObj` / `Space` enum (can be a
       simplified `isPassable(pos)` initially).
-- [ ] Update `Game.buildRoad` to call a new `Map.placeRoadSegments(from, dirs)`
+- [x] Update `Game.buildRoad` to call a new `Map.placeRoadSegments(from, dirs)`
       that sets both bits per segment (port `place_road_segments`), replacing
       the `has_road = true` loop. Backtrack-on-failure.
-- [ ] Update `renderRoads` and any `has_road` readers to use `paths`/`hasPath`.
-- [ ] Update serialize (`Savegame.zig` / `State.zig`) for the field rename.
-- [ ] **Test:** `buildRoad` sets exactly the right bits on a 3-segment road;
+- [x] Update `renderRoads` and any `has_road` readers to use `paths`/`hasPath`.
+- [x] Update serialize (`Savegame.zig` / `State.zig`) for the field rename.
+- [x] **Test:** `buildRoad` sets exactly the right bits on a 3-segment road;
       `hasPath` true on both ends of each segment; water-segment rejection.
 
 ### Phase 1 — `Road` struct + segment-by-segment building  *(core, ~1-2h)*
 
 **Files:** new `src/core/Road.zig`, `src/render/ui/RoadBuilder.zig`, `src/core/Game.zig`.
 
-- [ ] Port freeserf `Road` to `src/core/Road.zig`: `begin: MapPos`,
+- [x] Port freeserf `Road` to `src/core/Road.zig`: `begin: MapPos`,
       `dirs: std.ArrayList(Direction)` (or fixed `[256]u8` + len),
       `extend/undo/isUndo/isValidExtension/getEnd/hasPos`.
-- [ ] Rewrite `RoadBuilder` to hold a `Road` instead of a raw `path[]`:
+- [x] Rewrite `RoadBuilder` to hold a `Road` instead of a raw `path[]`:
       - `tryStartAt` → `road.start(pos)`.
       - `updatePath` stays (for the preview pathfinder) but feeds
         `road.extend` per step.
       - Add `canExtend(dir)` → `isRoadSegmentValid && isValidExtension`.
       - Add `undo()` for backspace.
-- [ ] Add `Game.canBuildRoad(road, player)` (port the whole-road validation +
+- [x] Add `Game.canBuildRoad(road, player)` (port the whole-road validation +
       water/ground classification). `buildRoad` calls it before
       `placeRoadSegments`.
-- [ ] Add `water_path` to flag linking (`FlagState` already has `next`/`length`;
+- [x] Add `water_path` to flag linking (`FlagState` already has `next`/`length`;
       add a `water: [6]bool` or a bit in `length`).
-- [ ] **Test:** undo removes the last segment; self-crossing rejected;
+- [x] **Test:** undo removes the last segment; self-crossing rejected;
       mid-road flag rejected; mixed water/ground rejected.
 
 ### Phase 2 — Fix the pathfinder  *(core, ~2-3h)*
 
 **Files:** `src/core/Pathfinder.zig`.
 
-- [ ] Fix the A* parent tracking: store `parent: ?u32` as a valid index into
+- [x] Fix the A* parent tracking: store `parent: ?u32` as a valid index into
       `open_list` at insertion time, or use a separate `came_from:
       AutoHashMap(MapPos, MapPos)` + `came_dir: AutoHashMap(MapPos, Direction)`.
       The hashmap approach is simpler and matches freeserf's closed-list.
-- [ ] Use freeserf's cost model: `walk_cost[h_diff] = {255,319,383,447,511}`
+- [x] Use freeserf's cost model: `walk_cost[h_diff] = {255,319,383,447,511}`
       + `heuristic` with `dist_x`/`dist_y`/`height`.
-- [ ] Neighbour validity = `isRoadSegmentValid(pos, d)` (not just
+- [x] Neighbour validity = `isRoadSegmentValid(pos, d)` (not just
       terrain-walkable) so the pathfinder only proposes valid road segments.
-- [ ] Support the `building_road` exclusion (don't route through the
+- [x] Support the `building_road` exclusion (don't route through the
       in-progress road's tiles except endpoints).
-- [ ] Return a `Road` (dirs list), not `Path` steps.
-- [ ] Wire into `RoadBuilder.updatePath`: replace the greedy `bestStep` with
+- [x] Return a `Road` (dirs list), not `Path` steps.
+- [x] Wire into `RoadBuilder.updatePath`: replace the greedy `bestStep` with
       `pathfinder_map(map, start, cursor, &road)`.
-- [ ] **Test:** routes around a water tile; routes around a mountain;
+- [x] **Test:** routes around a water tile; routes around a mountain;
       prefers shorter over longer; broken reconstruction fixed (path actually
       connects start→end).
 
@@ -301,14 +301,14 @@ patterns (build.zig steps, `tools/` inspection exes, `src/core/` + `src/render/`
 **Files:** `src/render/texture_atlas.zig`, `src/data/bmp.zig`,
           `src/render/sprite_batcher.zig`, `src/render/Renderer.zig`.
 
-- [ ] **Decode mask sprites.** `bmp.zig` `BmpDecoder` currently handles Solid
+- [x] **Decode mask sprites.** `bmp.zig` `BmpDecoder` currently handles Solid
       and Transparent. Add `decodeMask(data) → Sprite` (1-bit alpha-only,
       matches freeserf `SpriteDosMask`: RLE drop/fill but pixels are
       alpha=255, the rest alpha=0). PAK 230-245.
-- [ ] **Load path sprites into the atlas:** `atlas.loadRange(&pak, &decoder,
+- [x] **Load path sprites into the atlas:** `atlas.loadRange(&pak, &decoder,
       230, 246)` (masks) and `300, 309` (ground, solid). Store mask entries
       with a flag so the batcher knows to composite.
-- [ ] **Implement masked compositing.** Two options:
+- [x] **Implement masked compositing.** Two options:
   - **(A) Pre-composite at load time** (freeserf's approach): for each
     (mask, ground) pair the renderer will request, call
     `ground.get_masked(mask)` → one RGBA sprite → cache in atlas under a
@@ -321,16 +321,16 @@ patterns (build.zig steps, `tools/` inspection exes, `src/core/` + `src/render/`
     shader. Pro: no pre-composite. Con: shader change + second texture bind.
   - **Recommend (A)** — matches freeserf, keeps the batcher simple, 45
     sprites is tiny.
-- [ ] Add `Atlas.getRoadSprite(mask_index, ground_index) → ?AtlasEntry` that
+- [x] Add `Atlas.getRoadSprite(mask_index, ground_index) → ?AtlasEntry` that
       lazily composites & caches.
-- [ ] **Test (visual):** dump one composite to BMP via the existing
+- [x] **Test (visual):** dump one composite to BMP via the existing
       screenshot tool to confirm the mask×ground looks like a road strip.
 
 ### Phase 4 — Road rendering with slope  *(render, ~2-3h)*
 
 **Files:** `src/render/app.zig` (`renderRoads`).
 
-- [ ] Replace `addLine` road drawing with a port of
+- [x] Replace `addLine` road drawing with a port of
       `Viewport::draw_path_segment`:
       - For each visible tile, for each of the 3 forward dirs, if
         `hasPath(pos, d)`: compute `h_diff`, `h_diff_2` (cross-slope),
@@ -340,12 +340,12 @@ patterns (build.zig steps, `tools/` inspection exes, `src/core/` + `src/render/`
         freeserf's switch: Right subtracts `4*max(h1,h2)+2`, DownRight
         subtracts `4*h1+2`, Down shifts `lx -= 16` and subtracts `4*h1+2`).
       - Queue the composite sprite via `addSprite`.
-- [ ] Keep the torus-offset replication (existing `frame_offsets` loop).
-- [ ] Render the construction preview using the *same* `draw_path_segment`
+- [x] Keep the torus-offset replication (existing `frame_offsets` loop).
+- [x] Render the construction preview using the *same* `draw_path_segment`
       over the pending `Road.dirs` (so the preview looks like the real road,
       not a straight line).
-- [ ] Remove the brown `addLine` road code and the green/red preview line.
-- [ ] **Test (visual):** roads on flat terrain render as proper strips;
+- [x] Remove the brown `addLine` road code and the green/red preview line.
+- [x] **Test (visual):** roads on flat terrain render as proper strips;
       sloped roads follow the terrain; water-road uses sprite 9; roads wrap
       across map edges.
 
@@ -353,20 +353,20 @@ patterns (build.zig steps, `tools/` inspection exes, `src/core/` + `src/render/`
 
 **Files:** `src/render/ui/RoadBuilder.zig`, `src/render/app.zig`.
 
-- [ ] Compute `valid_dir: u6` mask each frame from the road's current end
+- [x] Compute `valid_dir: u6` mask each frame from the road's current end
       (`isRoadSegmentValid && isValidExtension` for each of 6 dirs).
-- [ ] Draw small arrow indicators (or highlight the 3 forward triangle-edges)
+- [x] Draw small arrow indicators (or highlight the 3 forward triangle-edges)
       on the end tile for the valid directions, green; invalid ones dim.
-- [ ] Backspace / right-click → `road.undo()`.
-- [ ] Esc → cancel (already exists).
-- [ ] Clicking a flag while building → run pathfinder → `extend_road`.
+- [x] Backspace / right-click → `road.undo()`.
+- [x] Esc → cancel (already exists).
+- [x] Clicking a flag while building → run pathfinder → `extend_road`.
       (Replaces the current "click second flag = build immediately".)
-- [ ] **Test:** can build a road around a mountain; undo works; can't build
+- [x] **Test:** can build a road around a mountain; undo works; can't build
       into water without a flag at the far end.
 
 ### Phase 6 — (Optional) Border rendering  *(render, ~1h)*
 
-- [ ] Port `draw_border_segment` for the owner-difference case in the same
+- [x] Port `draw_border_segment` for the owner-difference case in the same
       loop. Low priority; mostly cosmetic.
 
 ---

@@ -11,6 +11,7 @@ pub const serf_state = @import("SerfState.zig");
 pub const random = @import("Random.zig");
 pub const inventory = @import("Inventory.zig");
 pub const pathfinder = @import("Pathfinder.zig");
+pub const road = @import("Road.zig");
 pub const serf = @import("Serf.zig");
 pub const building = @import("Building.zig");
 pub const player = @import("Player.zig");
@@ -47,6 +48,7 @@ comptime {
     _ = random;
     _ = inventory;
     _ = pathfinder;
+    _ = road;
     _ = serf;
     _ = building;
     _ = player;

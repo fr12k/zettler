@@ -531,6 +531,10 @@ pub const App = struct {
         try atlas.loadBuildingSprites(&pak, &self.decoder, &mapObjectSpriteIds());
         try atlas.loadOverlaySprites(&pak, &self.decoder, &mapObjectShadowIds());
 
+        // Road sprites: path masks (PAK 230-245) × path grounds (PAK 300-308),
+        // pre-composited into mask×ground RGBA sprites for 3D road rendering.
+        try atlas.loadRoadSprites(&pak, &self.decoder);
+
         atlas.upload() catch |e| {
             std.debug.print("  Atlas upload error: {}\n", .{e});
             return;
@@ -1218,36 +1222,114 @@ pub const App = struct {
         return .{ .x = map.wrapX(col), .y = map.wrapY(row) };
     }
 
-    /// Draw roads (segments between connected road/flag tiles), flag posts, and
-    /// the road-building preview line. World-space, white fallback texture.
+    /// Compute the road sprite mask index and ground index for a road segment
+    /// from `pos` in direction `dir`. Ports freeserf's `draw_path_segment`
+    /// (viewport.cc:394) mask/ground selection logic.
+    ///
+    /// mask_index = h_diff + 4 + dir*9 (0..44, but we only have 16 mask sprites
+    /// so we clamp to the available range — freeserf uses 45 masks but the PAK
+    /// only has 16; we map by modular arithmetic).
+    /// ground_index = 0..8 based on cross-slope steepness + terrain type.
+    fn roadSpriteIndices(self: *App, pos: core.MapPos, dir: core.Direction) ?struct { mask: u8, ground: u8 } {
+        const map = &self.game.state.map;
+        const h1: i32 = @intCast(map.getHeight(pos));
+        const nb = map.getNeighborWrapped(pos, dir);
+        const h2: i32 = @intCast(map.getHeight(nb));
+        const h_diff: i32 = h1 - h2; // -4..+4
+
+        // Mask index: freeserf uses h_diff + 4 + dir*9, giving 0..44.
+        // We have 16 mask sprites (PAK 230-245), so we map the 45-index space
+        // into 0..15 by taking (h_diff + 4 + dir*3) mod 16. This gives a
+        // reasonable distribution of road shapes per direction and slope.
+        const mask_raw: i32 = h_diff + 4 + @as(i32, @intCast(@intFromEnum(dir))) * 3;
+        const mask: u8 = @intCast(@mod(mask_raw, 16));
+
+        // Ground index: 0-2 = grass (steep/gentle/flat), 3-5 = desert, 6-8 = snow.
+        // freeserf picks by cross-slope h_diff_2 and terrain; we simplify: use
+        // the source tile's terrain type and a flat/gentle/steep classification
+        // based on |h_diff|.
+        const terrain = map.getTile(pos).terrain;
+        var ground: u8 = switch (terrain) {
+            .desert => 3, // desert steep
+            .snow, .tundra => 6, // snow steep
+            else => 0, // grass steep (default, includes water→grass road)
+        };
+        // Adjust by slope: |h_diff| <= 1 → flat, <= 2 → gentle, else steep.
+        const abs_hdiff: i32 = if (h_diff < 0) -h_diff else h_diff;
+        ground += if (abs_hdiff <= 1) 2 else if (abs_hdiff <= 2) 1 else 0;
+        if (ground >= 9) ground = 8; // clamp
+
+        return .{ .mask = mask, .ground = ground };
+    }
+
+    /// Draw a single road segment sprite from `pos` in direction `dir`, at the
+    /// given torus offset. Ports freeserf's `draw_path_segment` (viewport.cc:394).
+    fn drawRoadSegment(self: *App, batcher: *SpriteBatcher, pos: core.MapPos, dir: core.Direction, off_x: f32, off_y: f32) void {
+        const indices = self.roadSpriteIndices(pos, dir) orelse return;
+        const entry = self.atlas.getRoadSprite(indices.mask, indices.ground) orelse return;
+
+        const map = &self.game.state.map;
+        const tw: f32 = map_renderer_mod.TileWidth;
+        const th: f32 = map_renderer_mod.TileHeight;
+        const hw: f32 = tw / 2.0;
+        const h1: f32 = @floatFromInt(map.getHeight(pos));
+        const nb = map.getNeighborWrapped(pos, dir);
+        const h2: f32 = @floatFromInt(map.getHeight(nb));
+
+        // Base world position of the source tile (top vertex of the diamond).
+        const wx_base = @as(f32, @floatFromInt(pos.x)) * tw - @as(f32, @floatFromInt(pos.y)) * hw;
+        const wy_base = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * h1;
+
+        // Per-direction position adjustment, porting freeserf's draw_path_segment:
+        // the road sprite is drawn at a y-offset that accounts for the height
+        // difference so the road strip follows the terrain slope.
+        var lx = wx_base;
+        var ly = wy_base;
+        switch (dir) {
+            .right => ly -= 4.0 * @max(h1, h2) + 2.0,
+            .down_right => ly -= 4.0 * h1 + 2.0,
+            .down => {
+                lx -= 16.0;
+                ly -= 4.0 * h1 + 2.0;
+            },
+            else => {}, // reverse dirs not drawn (only 3 forward dirs)
+        }
+
+        addSprite(batcher, entry, lx + off_x, ly + off_y, 1.0, 1.0);
+    }
+
+    /// Draw roads (sprite-based segments from the 6-bit paths bitmask), flag
+    /// posts, and the road-building preview. Uses the atlas texture for road
+    /// sprites; falls back to lines if the atlas isn't loaded.
     fn renderRoads(self: *App) void {
         const batcher = &self.sprite_batcher;
         const map = &self.game.state.map;
         batcher.begin();
 
-        // Road segments: for each road/flag tile, connect to forward neighbours
-        // that are also road/flag (forward dirs only, to avoid drawing twice).
-        // Uses viewport culling + wrapping so roads draw correctly across edges.
         const fwd = [_]core.Direction{ .right, .down_right, .down };
         const b = self.camera.visibleWorldBounds();
-        // Loop over active torus offset copies so roads/flags appear in every
-        // visible repeat of the map when zoomed out. The tile iterator is
-        // deduplicated to one period, so drawing each segment at each offset
-        // never duplicates at the same screen position.
+        const use_atlas = self.atlas_loaded and self.atlas.uploaded;
+
+        // Road segments: for each visible tile with paths, draw the 3 forward
+        // direction segments as sprite composites (or fallback lines).
         var it = culling_mod.visibleTiles(b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited);
         while (it.next()) |pos| {
             const t = map.getTile(pos);
-            if (!(t.has_road or t.has_flag)) continue;
+            if (!t.hasRoad() and !t.has_flag) continue;
             const c0_base = self.tileCenter(pos);
             for (self.frame_offsets[0..self.num_offsets]) |off| {
                 const c0x = c0_base[0] + off[0];
                 const c0y = c0_base[1] + off[1];
                 for (fwd) |d| {
+                    if (!map.hasPath(pos, d)) continue;
                     const np = map.getNeighborWrapped(pos, d);
-                    const nt = map.getTile(np);
-                    if (!(nt.has_road or nt.has_flag)) continue;
-                    const c1_base = self.tileCenter(np);
-                    addLine(batcher, c0x, c0y, c1_base[0] + off[0], c1_base[1] + off[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
+                    if (use_atlas) {
+                        self.drawRoadSegment(batcher, pos, d, off[0], off[1]);
+                    } else {
+                        // Fallback: brown line between tile centers.
+                        const c1_base = self.tileCenter(np);
+                        addLine(batcher, c0x, c0y, c1_base[0] + off[0], c1_base[1] + off[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
+                    }
                 }
             }
         }
@@ -1263,21 +1345,65 @@ pub const App = struct {
             }
         }
 
-        // Road-building preview: line from the chosen start flag to the cursor,
-        // green if a path exists, red otherwise.
+        // Road-building preview: draw the pending road segments as sprites
+        // (same as real roads), or a straight line fallback.
         if (self.road_builder.active and self.road_builder.has_start) {
-            const c0 = self.tileCenter(self.road_builder.start_flag_pos);
-            const c1 = self.tileCenter(self.road_builder.cursor_pos);
-            const col: [4]f32 = if (self.road_builder.has_path)
-                .{ 0.2, 0.9, 0.2, 0.8 }
-            else
-                .{ 0.9, 0.2, 0.2, 0.8 };
-            addLine(batcher, c0[0], c0[1], c1[0], c1[1], 3.0, col);
+            if (use_atlas and self.road_builder.has_path) {
+                // Draw each pending segment as a road sprite preview.
+                const p = self.road_builder.start_flag_pos;
+                const dirs = self.road_builder.road.dirsSlice();
+                for (self.frame_offsets[0..1]) |off| {
+                    var pp = p;
+                    for (dirs) |d| {
+                        self.drawRoadSegment(batcher, pp, d, off[0], off[1]);
+                        pp = map.getNeighborWrapped(pp, d);
+                    }
+                }
+            } else {
+                // Fallback: line from start to cursor.
+                const c0 = self.tileCenter(self.road_builder.start_flag_pos);
+                const c1 = self.tileCenter(self.road_builder.cursor_pos);
+                const col: [4]f32 = if (self.road_builder.has_path)
+                    .{ 0.2, 0.9, 0.2, 0.8 }
+                else
+                    .{ 0.9, 0.2, 0.2, 0.8 };
+                addLine(batcher, c0[0], c0[1], c1[0], c1[1], 3.0, col);
+            }
+        }
+
+        // Valid-direction indicators: draw small green dots on the road end
+        // tile for each direction where a new segment can be extended.
+        if (self.road_builder.active and self.road_builder.has_start) {
+            const mask = self.road_builder.validDirMask(map.*);
+            const end = self.road_builder.road.getEnd(map.*);
+            const end_c = self.tileCenter(end);
+            const all_dirs = std.meta.tags(core.Direction);
+            for (all_dirs, 0..) |d, i| {
+                if ((mask & (@as(u6, 1) << @intCast(i))) == 0) continue;
+                // Draw a small green dot at the midpoint toward direction d.
+                const nb = map.getNeighborWrapped(end, d);
+                const nb_c = self.tileCenter(nb);
+                const dot_x = (end_c[0] + nb_c[0]) * 0.5;
+                const dot_y = (end_c[1] + nb_c[1]) * 0.5;
+                batcher.add(.{
+                    .x = dot_x - 3, .y = dot_y - 3,
+                    .width = 6, .height = 6,
+                    .u = 0, .v = 0, .uw = 0, .vh = 0,
+                    .r = 0.2, .g = 0.9, .b = 0.2, .a = 0.9,
+                });
+            }
         }
 
         if (batcher.sprite_count == 0) return;
-        var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
-        batcher.render(&self.shader, &white_tex, &self.camera);
+        // Use the atlas texture if available (road sprites are packed in it);
+        // otherwise the white fallback texture for lines/flag posts.
+        if (use_atlas) {
+            var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
+            batcher.render(&self.shader, &atlas_tex, &self.camera);
+        } else {
+            var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
+            batcher.render(&self.shader, &white_tex, &self.camera);
+        }
     }
 
     /// Queue one building into the sprite batcher. Completed buildings draw their
@@ -1685,6 +1811,12 @@ fn onWindowResize(window: *glfw.GLFWwindow, width: c_int, height: c_int) callcon
 fn onKey(_: *glfw.GLFWwindow, key: c_int, _: c_int, action: c_int, _: c_int) callconv(.c) void {
     if (current_app) |app| {
         if (key == glfw.GLFW_KEY_ESCAPE and action == glfw.GLFW_PRESS) app.close();
+        // Backspace = undo last road segment while road building.
+        if (key == glfw.GLFW_KEY_BACKSPACE and action == glfw.GLFW_PRESS and
+            app.road_builder.active and app.road_builder.has_start)
+        {
+            _ = app.road_builder.undoSegment();
+        }
         if (key == 72 and action == glfw.GLFW_PRESS) app.show_hud = !app.show_hud;
 
         const p = action == glfw.GLFW_PRESS;
@@ -1774,19 +1906,36 @@ fn onMouseButton(_: *glfw.GLFWwindow, button: c_int, action: c_int, _: c_int) ca
                 }
 
                 // 2) Road building: first click picks a start flag, second
-                // click on another flag builds the road between them.
+                // click on another flag builds the road between them using
+                // A* pathfinding (findRoadPath) for proper routing around obstacles.
                 if (is_click and app.road_builder.active) {
                     const tpos = app.mouseToTile();
                     if (!app.road_builder.has_start) {
                         _ = app.road_builder.tryStartAt(tpos, &app.game.state.map);
                     } else if (app.game.state.map.getTile(tpos).has_flag and !tpos.eql(app.road_builder.start_flag_pos)) {
-                        // Recompute the path to the clicked flag, then build it.
-                        app.road_builder.updatePath(tpos, &app.game.state.map);
-                        _ = app.game.buildRoad(
-                            app.road_builder.start_flag_pos,
-                            tpos,
-                            app.road_builder.path[0..app.road_builder.path_len],
-                        );
+                        // Use A* to find a valid road path from start to target.
+                        var pf = core.pathfinder.Pathfinder.init(app.allocator, &app.game.state.map);
+                        defer pf.deinit(app.allocator);
+                        var path = core.pathfinder.Path{};
+                        if (pf.findRoadPath(app.road_builder.start_flag_pos, tpos, &path) catch false) {
+                            // Convert PathStep directions to u8 for buildRoad.
+                            var dirs_buf: [128]u8 = undefined;
+                            const n = @min(path.length, dirs_buf.len);
+                            for (path.steps[0..n], 0..) |step, i| dirs_buf[i] = @intFromEnum(step.dir);
+                            _ = app.game.buildRoad(
+                                app.road_builder.start_flag_pos,
+                                tpos,
+                                dirs_buf[0..n],
+                            );
+                        } else {
+                            // Fallback to greedy walker if A* fails.
+                            app.road_builder.updatePath(tpos, &app.game.state.map);
+                            _ = app.game.buildRoad(
+                                app.road_builder.start_flag_pos,
+                                tpos,
+                                app.road_builder.path[0..app.road_builder.path_len],
+                            );
+                        }
                         app.road_builder.deactivate();
                         app.panel.tool_mode = .none;
                     }
@@ -1820,10 +1969,18 @@ fn onMouseButton(_: *glfw.GLFWwindow, button: c_int, action: c_int, _: c_int) ca
             }
         }
         if (button == glfw.GLFW_MOUSE_BUTTON_RIGHT and action == glfw.GLFW_PRESS) {
-            app.panel.selected_building = .none;
-            app.building_placer.deactivate();
-            app.road_builder.deactivate();
-            app.panel.tool_mode = .none;
+            // Right-click while road building: undo last segment, or cancel
+            // if the road is empty.
+            if (app.road_builder.active and app.road_builder.has_start and
+                app.road_builder.road.len > 0)
+            {
+                _ = app.road_builder.undoSegment();
+            } else {
+                app.panel.selected_building = .none;
+                app.building_placer.deactivate();
+                app.road_builder.deactivate();
+                app.panel.tool_mode = .none;
+            }
         }
     }
 }

@@ -76,10 +76,17 @@ pub const MapObject = enum(u8) {
 };
 
 /// A single tile on the map.
+///
+/// `paths` is a 6-bit bitmask of road segments leaving this tile, one bit per
+/// `Direction` (bit 0=Right, 1=DownRight, 2=Down, 3=Left, 4=UpLeft, 5=Up).
+/// A road segment between tiles A and B sets TWO bits: the forward direction
+/// on A and the reverse on B. This mirrors freeserf's `GameTile.paths` and
+/// makes "is there a road leaving this tile in direction d?" a single bit test.
 pub const Tile = struct {
     terrain: Terrain = .grass,
     height: u4 = 0,
-    has_road: bool = false,
+    /// 6-bit road-segment bitmask (bit index = @intFromEnum(Direction)).
+    paths: u6 = 0,
     has_flag: bool = false,
     has_building: bool = false,
     owner: u8 = 0xFF,
@@ -92,7 +99,22 @@ pub const Tile = struct {
     object: MapObject = .none,
     /// Sprite variant within the object family (0..7).
     object_variant: u8 = 0,
+
+    /// True if any road segment leaves this tile (paths bitmask != 0).
+    pub fn hasRoad(self: Tile) bool {
+        return self.paths != 0;
+    }
+
+    /// True if a road segment leaves this tile in the given direction.
+    pub fn hasPath(self: Tile, dir: Direction) bool {
+        return (self.paths & pathBit(dir)) != 0;
+    }
 };
+
+/// The bitmask for a single direction's path bit.
+pub fn pathBit(dir: Direction) u6 {
+    return @as(u6, 1) << @intCast(@intFromEnum(dir));
+}
 
 /// Terrain generation constants.
 pub const TerrainGen = struct {
@@ -168,7 +190,7 @@ pub const Map = struct {
     /// Magic bytes identifying a zettler map file ("ZMAP").
     pub const file_magic: [4]u8 = .{ 'Z', 'M', 'A', 'P' };
     /// Version of the map file format stored in the header.
-    pub const file_version: u32 = 1;
+    pub const file_version: u32 = 2;
 
     /// Serialize the map (dimensions + raw tile bytes) to `path`.
     /// Overwrites any existing file. Returns an error on I/O failure or if
@@ -400,6 +422,115 @@ pub const Map = struct {
     pub fn isOwnedBy(self: Map, pos: MapPos, player: u8) bool {
         if (!self.isValidPos(pos)) return false;
         return self.getTile(pos).owner == player;
+    }
+
+    // ── Road / path bitmask API ───────────────────────────────────────
+    //
+    // Mirrors freeserf's `Map::paths/has_path/add_path/del_path` plus the
+    // single-segment validity check `is_road_segment_valid`. The 6-bit
+    // `Tile.paths` field stores one bit per Direction; a segment between A
+    // and B sets the forward bit on A and the reverse bit on B.
+
+    /// Return the 6-bit path bitmask for the tile at `pos` (0 if invalid).
+    pub fn paths(self: Map, pos: MapPos) u6 {
+        if (!self.isValidPos(pos)) return 0;
+        return self.getTile(pos).paths;
+    }
+
+    /// True if a road segment leaves `pos` in direction `dir`.
+    pub fn hasPath(self: Map, pos: MapPos, dir: Direction) bool {
+        if (!self.isValidPos(pos)) return false;
+        return self.getTile(pos).hasPath(dir);
+    }
+
+    /// Set the path bit for `dir` on `pos` (does NOT touch the neighbour).
+    pub fn addPath(self: *Map, pos: MapPos, dir: Direction) void {
+        if (!self.isValidPos(pos)) return;
+        self.getTile(pos).paths |= pathBit(dir);
+    }
+
+    /// Clear the path bit for `dir` on `pos` (does NOT touch the neighbour).
+    pub fn delPath(self: *Map, pos: MapPos, dir: Direction) void {
+        if (!self.isValidPos(pos)) return;
+        self.getTile(pos).paths &= ~pathBit(dir);
+    }
+
+    /// Whether a tile is passable for road building. Currently a simplified
+    /// version of freeserf's `map_space_from_obj` check: a tile is passable if
+    //  it has no building. Flags are passable (roads merge into flags). Water
+    //  is handled by `isRoadSegmentValid`'s water-continuity rule.
+    pub fn isPassable(self: Map, pos: MapPos) bool {
+        if (!self.isValidPos(pos)) return false;
+        return !self.getTile(pos).has_building;
+    }
+
+    /// Validate a single road segment from `pos` in direction `dir`, porting
+    /// freeserf `Map::is_road_segment_valid` (map.cc:572). Returns true iff:
+    //
+    //  1. The destination tile has no existing paths unless it is a flag.
+    //  2. The destination tile is passable (no building on it).
+    //  3. Both tiles have the same owner (owned territory contiguous),
+    //     treating unowned (0xFF) as compatible with any owner — zettler
+    //     doesn't yet have military territory claiming, so intermediate
+    //     tiles are often unowned and must remain buildable.
+    //  4. Water continuity: if one tile is water and the other isn't, at
+    //     least one end must be a flag (water roads only connect flag-to-flag).
+    pub fn isRoadSegmentValid(self: Map, pos: MapPos, dir: Direction) bool {
+        if (!self.isValidPos(pos)) return false;
+        const dest = self.getNeighborWrapped(pos, dir);
+        if (!self.isValidPos(dest)) return false;
+        const src_tile = self.getTile(pos);
+        const dst_tile = self.getTile(dest);
+
+        // Rule 1: destination must be path-free unless it's a flag.
+        if (dst_tile.paths != 0 and !dst_tile.has_flag) return false;
+
+        // Rule 2: destination must be passable (no building blocking it).
+        if (dst_tile.has_building) return false;
+
+        // Rule 3: same owner on both ends (unowned tiles are compatible).
+        if (src_tile.owner != 0xFF and dst_tile.owner != 0xFF and
+            src_tile.owner != dst_tile.owner) return false;
+
+        // Rule 4: water continuity — a road may not dip into water mid-segment
+        // unless one end is a flag (flag-to-flag water roads are allowed).
+        const src_water = src_tile.terrain.isWater();
+        const dst_water = dst_tile.terrain.isWater();
+        if (src_water != dst_water) {
+            if (!src_tile.has_flag and !dst_tile.has_flag) return false;
+        }
+
+        return true;
+    }
+
+    /// Place all segments of a road: for each direction step from `start`, set
+    /// the forward bit on the current tile and the reverse bit on the
+    /// neighbour, then advance. Mirrors freeserf `place_road_segments`
+    //  (map.cc:596). On any invalid segment the already-set bits are cleared
+    //  (backtrack) and false is returned.
+    pub fn placeRoadSegments(self: *Map, start: MapPos, dirs: []const Direction) bool {
+        if (dirs.len == 0) return false;
+        var pos = start;
+        var set: usize = 0;
+        for (dirs) |d| {
+            if (!self.isRoadSegmentValid(pos, d)) {
+                // Backtrack: clear the bits we already set.
+                var bp = start;
+                for (dirs[0..set]) |bd| {
+                    self.delPath(bp, bd);
+                    const nb = self.getNeighborWrapped(bp, bd);
+                    self.delPath(nb, bd.opposite());
+                    bp = self.wrapPos(bp.move(bd));
+                }
+                return false;
+            }
+            const nb = self.getNeighborWrapped(pos, d);
+            self.addPath(pos, d);
+            self.addPath(nb, d.opposite());
+            pos = self.wrapPos(pos.move(d));
+            set += 1;
+        }
+        return true;
     }
 
     /// Generate terrain using periodic Perlin noise (seamless torus wrapping).

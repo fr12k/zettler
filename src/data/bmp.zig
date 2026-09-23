@@ -203,4 +203,111 @@ pub const BmpDecoder = struct {
             .pixels = pixels,
         };
     }
+
+    /// Composite a mask sprite onto a ground sprite, producing a single RGBA
+    /// sprite where the ground texture shows only where the mask is opaque.
+    /// This is freeserf's `ground.get_masked(mask)` approach (gfx.cc:226).
+    /// The result has the dimensions of the ground sprite; the mask is
+    /// aligned by their offset_x/offset_y hotspots.
+    pub fn compositeMasked(
+        self: *BmpDecoder,
+        mask: *const Sprite,
+        ground: *const Sprite,
+    ) !Sprite {
+        const w = ground.width;
+        const h = ground.height;
+        const pixels = try self.allocator.alloc(ColorRGBA, w * h);
+        errdefer self.allocator.free(pixels);
+
+        // The mask offset relative to the ground sprite's top-left.
+        // Both sprites have offset_x/offset_y hotspots; the mask's hotspot
+        // should align to the same screen position as the ground's hotspot.
+        const mask_dx: i32 = @as(i32, mask.offset_x) - @as(i32, ground.offset_x);
+        const mask_dy: i32 = @as(i32, mask.offset_y) - @as(i32, ground.offset_y);
+
+        for (0..h) |gy| {
+            for (0..w) |gx| {
+                const ground_px = ground.pixels[gy * w + gx];
+                // Sample the mask at the corresponding position.
+                const mx: i32 = @as(i32, @intCast(gx)) + mask_dx;
+                const my: i32 = @as(i32, @intCast(gy)) + mask_dy;
+                var mask_alpha: u8 = 0;
+                if (mx >= 0 and my >= 0 and
+                    mx < @as(i32, @intCast(mask.width)) and
+                    my < @as(i32, @intCast(mask.height)))
+                {
+                    mask_alpha = mask.pixels[@as(usize, @intCast(my)) * mask.width +
+                        @as(usize, @intCast(mx))].a;
+                }
+                // Where mask is opaque, show the ground pixel; else transparent.
+                pixels[gy * w + gx] = .{
+                    .r = ground_px.r,
+                    .g = ground_px.g,
+                    .b = ground_px.b,
+                    .a = mask_alpha,
+                };
+            }
+        }
+
+        return .{
+            .width = w,
+            .height = h,
+            .delta_x = ground.delta_x,
+            .delta_y = ground.delta_y,
+            .offset_x = ground.offset_x,
+            .offset_y = ground.offset_y,
+            .pixels = pixels,
+        };
+    }
+
+    /// Decode a MASK sprite (AssetPathMask, SpriteTypeMask). These are 1-bit
+    /// alpha masks used to stencil road shapes onto ground textures. Format
+    /// after the 10-byte header: RLE pairs (drop, fill) where `drop` = transparent
+    /// pixels and `fill` = opaque white pixels (alpha=255). The RGB is white
+    /// so that when used as a mask×ground composite, the ground texture shows
+    /// through where the mask is opaque.
+    pub fn decodeMask(self: *BmpDecoder, data: []const u8) !Sprite {
+        if (data.len < 10) return error.InvalidSprite;
+
+        const delta_x: i8 = @bitCast(data[0]);
+        const delta_y: i8 = @bitCast(data[1]);
+        const width: u32 = std.mem.readInt(u16, data[2..4], .little);
+        const height: u32 = std.mem.readInt(u16, data[4..6], .little);
+        const offset_x: i16 = std.mem.readInt(i16, data[6..8], .little);
+        const offset_y: i16 = std.mem.readInt(i16, data[8..10], .little);
+
+        if (width == 0 or height == 0) return error.InvalidSpriteSize;
+        if (width > 2048 or height > 2048) return error.InvalidSpriteSize;
+
+        const pixel_count = width * height;
+        const pixels = try self.allocator.alloc(ColorRGBA, pixel_count);
+        errdefer self.allocator.free(pixels);
+        @memset(pixels, ColorRGBA{ .r = 0, .g = 0, .b = 0, .a = 0 });
+
+        const raw = data[10..];
+        var pos: usize = 0;
+        var i: usize = 0;
+        while (i + 1 < raw.len and pos < pixel_count) {
+            const drop = raw[i];
+            const fill = raw[i + 1];
+            i += 2;
+            pos += drop; // transparent run
+            for (0..fill) |_| {
+                if (pos >= pixel_count) break;
+                // Opaque white — the mask stencil.
+                pixels[pos] = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+                pos += 1;
+            }
+        }
+
+        return .{
+            .width = width,
+            .height = height,
+            .delta_x = delta_x,
+            .delta_y = delta_y,
+            .offset_x = offset_x,
+            .offset_y = offset_y,
+            .pixels = pixels,
+        };
+    }
 };

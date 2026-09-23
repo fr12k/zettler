@@ -23,7 +23,7 @@ pub const AtlasEntry = struct {
 };
 
 /// Maximum number of sprites that can be packed into the atlas.
-pub const MAX_ATLAS_SPRITES: usize = 4096;
+pub const MAX_ATLAS_SPRITES: usize = 8192;
 /// Atlas size (power of two).
 pub const ATLAS_SIZE: u32 = 2048;
 /// Margin between sprites in the atlas (to avoid bleeding).
@@ -31,9 +31,17 @@ pub const ATLAS_MARGIN: u32 = 1;
 
 /// Size of the direct lookup table indexed by sprite ID. Covers all sprite
 /// IDs used by the game (terrain ≤ 292, waves ≤ 645, buildings/shadows
-/// ≤ MAP_OBJECT_BASE + 0xc0 + 250 ≈ 1700). Sized to 4096 to match
-/// MAX_ATLAS_SPRITES and leave headroom for future sprite ranges.
-const LOOKUP_TABLE_SIZE: usize = 4096;
+/// ≤ MAP_OBJECT_BASE + 0xc0 + 250 ≈ 1700) plus road composite sprites
+/// at IDs 0x1000..0x13FF (mask×ground pre-composites). Sized to 8192.
+const LOOKUP_TABLE_SIZE: usize = 8192;
+
+/// Base sprite ID for road composite sprites (mask×ground pre-composites).
+/// Composite ID = ROAD_COMPOSITE_BASE | (mask_index << 6) | ground_index.
+pub const ROAD_COMPOSITE_BASE: u16 = 0x1000;
+/// Maximum mask index (AssetPathMask has 16 entries).
+pub const ROAD_MASK_COUNT: usize = 16;
+/// Maximum ground index (AssetPathGround has 9 entries).
+pub const ROAD_GROUND_COUNT: usize = 9;
 
 /// Texture atlas — builds and manages a single large texture containing many sprites.
 pub const TextureAtlas = struct {
@@ -224,5 +232,56 @@ pub const TextureAtlas = struct {
             defer sprite.deinit(self.allocator);
             _ = try self.packSprite(i, &sprite);
         }
+    }
+
+    /// Load path mask sprites (PAK 230-245) and path ground sprites (PAK 300-308)
+    /// and pre-composite every (mask, ground) pair into a single RGBA sprite.
+    /// The composite is cached at sprite ID = ROAD_COMPOSITE_BASE | (mask << 6) | ground.
+    /// This is freeserf's approach: `ground.get_masked(mask)` (gfx.cc:226).
+    /// Only ~45 composites are actually used (3 dirs × ~5 slopes × 3 terrains),
+    /// but we pre-composite all 16×9 = 144 for simplicity.
+    pub fn loadRoadSprites(self: *TextureAtlas, pak: *const PakFile, decoder: *BmpDecoder) !void {
+        const mask_base: u16 = 230;
+        const ground_base: u16 = 300;
+
+        // Decode all mask sprites and keep them alive for compositing.
+        var masks: [ROAD_MASK_COUNT]?Sprite = @splat(null);
+        defer for (&masks) |*m| { if (m.*) |*s| s.deinit(self.allocator); };
+
+        for (0..ROAD_MASK_COUNT) |mi| {
+            const id = mask_base + @as(u16, @intCast(mi));
+            if (id >= pak.fileCount()) break;
+            const raw = pak.getFile(id) catch continue;
+            masks[mi] = decoder.decodeMask(raw) catch null;
+        }
+
+        // Decode each ground sprite and composite with every mask.
+        for (0..ROAD_GROUND_COUNT) |gi| {
+            const gid = ground_base + @as(u16, @intCast(gi));
+            if (gid >= pak.fileCount()) break;
+            const graw = pak.getFile(gid) catch continue;
+            var ground = decoder.decode(graw) catch continue;
+            defer ground.deinit(self.allocator);
+
+            for (0..ROAD_MASK_COUNT) |mi| {
+                if (masks[mi] == null) continue;
+                var composite = decoder.compositeMasked(&masks[mi].?, &ground) catch continue;
+                defer composite.deinit(self.allocator);
+                const sid: u16 = ROAD_COMPOSITE_BASE |
+                    (@as(u16, @intCast(mi)) << 6) |
+                    @as(u16, @intCast(gi));
+                _ = self.packSprite(sid, &composite) catch continue;
+            }
+        }
+    }
+
+    /// Get a road composite sprite entry by mask index (0..15) and ground
+    /// index (0..8). Returns null if the composite hasn't been loaded.
+    pub fn getRoadSprite(self: *TextureAtlas, mask_index: u8, ground_index: u8) ?AtlasEntry {
+        if (mask_index >= ROAD_MASK_COUNT or ground_index >= ROAD_GROUND_COUNT) return null;
+        const sid: u16 = ROAD_COMPOSITE_BASE |
+            (@as(u16, mask_index) << 6) |
+            @as(u16, ground_index);
+        return self.get(sid);
     }
 };
