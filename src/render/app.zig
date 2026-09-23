@@ -174,6 +174,13 @@ fn playerBorderColor(player: u8) [4]f32 {
     };
 }
 
+/// Clamp an i32 to the range [lo, hi].
+fn clamp3(val: i32, lo: i32, hi: i32) i32 {
+    if (val < lo) return lo;
+    if (val > hi) return hi;
+    return val;
+}
+
 /// PAK sprite id for a standing object of the given family + variant (0..7).
 fn objectSpriteId(obj: MapObject, variant: u8) u16 {
     const v: u16 = @min(variant, 7);
@@ -1246,28 +1253,30 @@ pub const App = struct {
     /// from `pos` in direction `dir`. Ports freeserf's `draw_path_segment`
     /// (viewport.cc:394) mask/ground selection logic.
     ///
-    /// mask_index = h_diff + 4 + dir*9 (0..44, but we only have 16 mask sprites
-    /// so we clamp to the available range — freeserf uses 45 masks but the PAK
-    /// only has 16; we map by modular arithmetic).
-    /// ground_index = 0..8 based on cross-slope steepness + terrain type.
+    /// The 16 path mask sprites (PAK 230-245) are organized as:
+    ///   - masks 0-7  (PAK 230-237, 32px wide): Right direction, 8 slope variants
+    ///   - masks 8-11 (PAK 238-241, 16px wide): DownRight direction, 4 slope variants
+    ///   - masks 12-15 (PAK 242-245, 16px wide): Down direction, 4 slope variants
+    /// Within each group, the index is h_diff+4 clamped to the group size.
+    ///
+    /// ground_index = 0..8: 0-2 = grass (steep/gentle/flat), 3-5 = desert, 6-8 = snow.
     fn roadSpriteIndices(self: *App, pos: core.MapPos, dir: core.Direction) ?struct { mask: u8, ground: u8 } {
         const map = &self.game.state.map;
         const h1: i32 = @intCast(map.getHeight(pos));
         const nb = map.getNeighborWrapped(pos, dir);
         const h2: i32 = @intCast(map.getHeight(nb));
         const h_diff: i32 = h1 - h2; // -4..+4
+        const h_clamped: i32 = clamp3(h_diff + 4, 0, 7);
 
-        // Mask index: freeserf uses h_diff + 4 + dir*9, giving 0..44.
-        // We have 16 mask sprites (PAK 230-245), so we map the 45-index space
-        // into 0..15 by taking (h_diff + 4 + dir*3) mod 16. This gives a
-        // reasonable distribution of road shapes per direction and slope.
-        const mask_raw: i32 = h_diff + 4 + @as(i32, @intCast(@intFromEnum(dir))) * 3;
-        const mask: u8 = @intCast(@mod(mask_raw, 16));
+        // Mask index: per-direction groups within the 16 mask sprites.
+        const mask: u8 = switch (dir) {
+            .right => @intCast(h_clamped),           // 0-7
+            .down_right => @intCast(8 + clamp3(h_diff + 4, 0, 3)), // 8-11
+            .down => @intCast(12 + clamp3(h_diff + 4, 0, 3)),      // 12-15
+            else => return null, // reverse dirs not drawn
+        };
 
         // Ground index: 0-2 = grass (steep/gentle/flat), 3-5 = desert, 6-8 = snow.
-        // freeserf picks by cross-slope h_diff_2 and terrain; we simplify: use
-        // the source tile's terrain type and a flat/gentle/steep classification
-        // based on |h_diff|.
         const terrain = map.getTile(pos).terrain;
         var ground: u8 = switch (terrain) {
             .desert => 3, // desert steep
@@ -1294,25 +1303,48 @@ pub const App = struct {
         const hw: f32 = tw / 2.0;
         const h1: f32 = @floatFromInt(map.getHeight(pos));
         const nb = map.getNeighborWrapped(pos, dir);
-        const h2: f32 = @floatFromInt(map.getHeight(nb));
+        _ = nb; // neighbour height not needed for positioning; mask encodes slope
 
-        // Base world position of the source tile (top vertex of the diamond).
+        // Base world position of the source tile's left vertex (same as
+        // tileCenter: col*TW - row*HW, row*TH - HEIGHT_SCALE*h).
         const wx_base = @as(f32, @floatFromInt(pos.x)) * tw - @as(f32, @floatFromInt(pos.y)) * hw;
         const wy_base = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * h1;
 
-        // Per-direction position adjustment, porting freeserf's draw_path_segment:
-        // the road sprite is drawn at a y-offset that accounts for the height
-        // difference so the road strip follows the terrain slope.
+        // The road sprite is a strip that covers the edge between this tile
+        // and the neighbour. The mask sprite's pixel data encodes the road
+        // shape for that edge. Position the sprite at the tile's left vertex,
+        // adjusted per-direction so the strip aligns to the correct edge.
+        //
+        // For Right: the edge is the right side of the diamond (from top
+        //   vertex to right vertex). The 32px-wide mask covers this. Draw
+        //   at the tile's left vertex; the mask spans the full tile width.
+        // For DownRight: the edge is from the right vertex to the bottom-right
+        //   vertex. The 16px-wide mask covers this half-tile span.
+        // For Down: the edge is from the bottom-left vertex to the bottom-right
+        //   vertex. The 16px-wide mask covers this, shifted left by half-width.
         var lx = wx_base;
         var ly = wy_base;
         switch (dir) {
-            .right => ly -= 4.0 * @max(h1, h2) + 2.0,
-            .down_right => ly -= 4.0 * h1 + 2.0,
-            .down => {
-                lx -= 16.0;
-                ly -= 4.0 * h1 + 2.0;
+            .right => {
+                // The road strip sits on the upper-right edge of the diamond.
+                // Shift up by half the tile height to center on the edge.
+                ly -= th * 0.5;
             },
-            else => {}, // reverse dirs not drawn (only 3 forward dirs)
+            .down_right => {
+                // The road strip sits on the right half of the diamond,
+                // from top to bottom-right. Shift right by half width and
+                // up by half height.
+                lx += hw;
+                ly -= th * 0.5;
+            },
+            .down => {
+                // The road strip sits on the lower-left edge, from left
+                // vertex to bottom-left. Shift left by half width and
+                // down by half height.
+                lx -= hw;
+                ly += th * 0.5;
+            },
+            else => return, // reverse dirs not drawn
         }
 
         addSprite(batcher, entry, lx + off_x, ly + off_y, 1.0, 1.0);
