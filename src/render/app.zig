@@ -1302,49 +1302,32 @@ pub const App = struct {
         const th: f32 = map_renderer_mod.TileHeight;
         const hw: f32 = tw / 2.0;
         const h1: f32 = @floatFromInt(map.getHeight(pos));
-        const nb = map.getNeighborWrapped(pos, dir);
-        _ = nb; // neighbour height not needed for positioning; mask encodes slope
 
-        // Base world position of the source tile's left vertex (same as
-        // tileCenter: col*TW - row*HW, row*TH - HEIGHT_SCALE*h).
-        const wx_base = @as(f32, @floatFromInt(pos.x)) * tw - @as(f32, @floatFromInt(pos.y)) * hw;
-        const wy_base = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * h1;
+        // Base world position of the source tile's left vertex.
+        // screen_x = col*TW - row*HW, screen_y = row*TH - HEIGHT_SCALE*h
+        const wx = @as(f32, @floatFromInt(pos.x)) * tw - @as(f32, @floatFromInt(pos.y)) * hw;
+        const wy = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * h1;
 
-        // The road sprite is a strip that covers the edge between this tile
-        // and the neighbour. The mask sprite's pixel data encodes the road
-        // shape for that edge. Position the sprite at the tile's left vertex,
-        // adjusted per-direction so the strip aligns to the correct edge.
-        //
-        // For Right: the edge is the right side of the diamond (from top
-        //   vertex to right vertex). The 32px-wide mask covers this. Draw
-        //   at the tile's left vertex; the mask spans the full tile width.
-        // For DownRight: the edge is from the right vertex to the bottom-right
-        //   vertex. The 16px-wide mask covers this half-tile span.
-        // For Down: the edge is from the bottom-left vertex to the bottom-right
-        //   vertex. The 16px-wide mask covers this, shifted left by half-width.
-        var lx = wx_base;
-        var ly = wy_base;
+        // The road composite sprite is 32x20 (ground size) with the road strip
+        // vertically centered. Draw it at the tile's left vertex position.
+        // Per-direction x offset: DownRight and Down masks are 16px wide (half
+        // tile), so they need to be shifted to cover the correct half of the
+        // tile diamond.
+        var lx = wx;
+        const ly = wy;
         switch (dir) {
             .right => {
-                // The road strip sits on the upper-right edge of the diamond.
-                // Shift up by half the tile height to center on the edge.
-                ly -= th * 0.5;
+                // 32px mask covers the full tile width. No x offset.
             },
             .down_right => {
-                // The road strip sits on the right half of the diamond,
-                // from top to bottom-right. Shift right by half width and
-                // up by half height.
+                // 16px mask covers the right half of the diamond.
                 lx += hw;
-                ly -= th * 0.5;
             },
             .down => {
-                // The road strip sits on the lower-left edge, from left
-                // vertex to bottom-left. Shift left by half width and
-                // down by half height.
+                // 16px mask covers the left half of the diamond.
                 lx -= hw;
-                ly += th * 0.5;
             },
-            else => return, // reverse dirs not drawn
+            else => return,
         }
 
         addSprite(batcher, entry, lx + off_x, ly + off_y, 1.0, 1.0);
