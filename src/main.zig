@@ -13,6 +13,7 @@ const Game = core.game.Game;
 const Resource = core.Resource;
 const Building = core.Building;
 const MapPos = core.types.MapPos;
+const Direction = core.Direction;
 const MapMinSize = core.map.MIN_SIZE;
 const MapMaxSize = core.map.MAX_SIZE;
 
@@ -48,6 +49,8 @@ const CliOptions = struct {
     /// of the default center cluster, so zoom-out rendering can be verified at
     /// every position and every torus offset copy.
     scatter_buildings: bool = false,
+    /// Connect placed buildings with roads for screenshot testing.
+    build_roads: bool = false,
     help: bool = false,
 };
 
@@ -104,6 +107,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !CliOptions {
             opts.perf_frames = std.fmt.parseInt(u64, val, 10) catch return error.InvalidSeed;
         } else if (std.mem.eql(u8, arg, "--scatter-buildings")) {
             opts.scatter_buildings = true;
+        } else if (std.mem.eql(u8, arg, "--build-roads")) {
+            opts.build_roads = true;
         } else if (std.mem.eql(u8, arg, "--map-size")) {
             // Parse both values into temporaries and only commit to `opts`
             // when both succeed, so a bad height does not leave a lopsided
@@ -229,6 +234,8 @@ fn printUsage() void {
         \\  --perf-frames <N>     Exit after N frames (headless perf run).
         \\  --scatter-buildings   Spread buildings across the whole map instead
         \\                       of a center cluster (for zoom-out testing).
+        \\  --build-roads         Connect placed buildings with roads for
+        \\                       screenshot testing of road rendering.
         \\  -h, --help            Show this help and exit.
         \\
         \\Map sizes from {d}x{d} to {d}x{d} are supported.
@@ -277,6 +284,7 @@ fn runGlfwDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {
         .perf_log = opts.perf,
         .perf_frames = opts.perf_frames,
         .scatter_buildings = opts.scatter_buildings,
+        .build_roads = opts.build_roads,
     });
     errdefer app.deinit();
 
@@ -360,18 +368,35 @@ fn setupDemoScene(app: *App) !void {
         positions = scatter_buf[0..];
         std.debug.print("  Scene: {} buildings (scattered across map)\n", .{positions.len});
     } else {
-        const default_positions = [_]MapPos{
-            .{ .x = cx + 3, .y = cy },
-            .{ .x = cx, .y = cy + 3 },
-            .{ .x = cx, .y = cy },
-            .{ .x = cx + 2, .y = cy + 2 },
-            .{ .x = cx - 3, .y = cy },
-            .{ .x = cx + 1, .y = cy - 2 },
-            .{ .x = cx - 2, .y = cy + 1 },
-            .{ .x = cx + 2, .y = cy - 1 },
-            .{ .x = cx - 1, .y = cy + 2 },
-        };
-        positions = &default_positions;
+        if (app.build_roads) {
+            // Spread buildings further apart so roads have room to route
+            // between them without hitting other buildings/flags.
+            const default_positions = [_]MapPos{
+                .{ .x = cx + 8, .y = cy },      // 0: lumberjack (right)
+                .{ .x = cx, .y = cy + 8 },      // 1: fisher (below)
+                .{ .x = cx, .y = cy },          // 2: stock (center)
+                .{ .x = cx + 6, .y = cy + 6 },  // 3: sawmill
+                .{ .x = cx - 8, .y = cy },      // 4: forester (left)
+                .{ .x = cx + 1, .y = cy - 8 },  // 5: farm (above)
+                .{ .x = cx - 6, .y = cy + 6 },  // 6: tower
+                .{ .x = cx - 6, .y = cy - 6 },  // 7: stonecutter
+                .{ .x = cx + 6, .y = cy - 6 },  // 8: mill
+            };
+            positions = &default_positions;
+        } else {
+            const default_positions = [_]MapPos{
+                .{ .x = cx + 3, .y = cy },
+                .{ .x = cx, .y = cy + 3 },
+                .{ .x = cx, .y = cy },
+                .{ .x = cx + 2, .y = cy + 2 },
+                .{ .x = cx - 3, .y = cy },
+                .{ .x = cx + 1, .y = cy - 2 },
+                .{ .x = cx - 2, .y = cy + 1 },
+                .{ .x = cx + 2, .y = cy - 1 },
+                .{ .x = cx - 1, .y = cy + 2 },
+            };
+            positions = &default_positions;
+        }
     }
 
     for (positions) |pos| {
@@ -402,6 +427,104 @@ fn setupDemoScene(app: *App) !void {
     if (!app.scatter_buildings) {
         std.debug.print("  Scene: {} buildings\n", .{building_types.len});
     }
+
+    // Optionally connect the placed buildings with roads.
+    if (app.build_roads) {
+        try buildDemoRoads(game, positions);
+    }
+}
+
+/// Greedy chebyshev-style distance for road pathfinding.
+fn hexDist(a: MapPos, b: MapPos) i32 {
+    const dx = @as(i32, a.x) - @as(i32, b.x);
+    const dy = @as(i32, a.y) - @as(i32, b.y);
+    return @intCast(@max(@abs(dx), @abs(dy)));
+}
+
+/// Pick the step direction from `from` that gets closest to `to`, skipping
+/// buildings and existing flags (except the destination).
+fn bestStepDir(from: MapPos, to: MapPos, map: *core.map.Map) ?Direction {
+    var best_dir: ?Direction = null;
+    var best_d: i32 = std.math.maxInt(i32);
+    const dirs = std.meta.tags(Direction);
+    for (dirs) |d| {
+        const np = map.getNeighborWrapped(from, d);
+        if (np.eql(to)) return d;
+        const t = map.getTile(np);
+        // Skip buildings and flags (roads can only merge into the dest flag).
+        if (t.has_building or t.has_flag) continue;
+        const dd = hexDist(np, to);
+        if (dd < best_d) {
+            best_d = dd;
+            best_dir = d;
+        }
+    }
+    return best_dir;
+}
+
+/// Build roads between consecutive building flags. Each building's flag is at
+/// `pos.move(.down_right)`. Clears terrain to grass along the path and uses
+/// a greedy walker to find the route.
+fn buildDemoRoads(game: *Game, positions: []const MapPos) !void {
+    const map = &game.state.map;
+    var connected: usize = 0;
+
+    // Connect each building to the next one in the list (chain), and also
+    // connect a few cross-links for a more interesting road network.
+    const links = [_]struct { from: usize, to: usize }{
+        .{ .from = 0, .to = 1 }, // lumberjack -> fisher
+        .{ .from = 1, .to = 2 }, // fisher -> stock
+        .{ .from = 2, .to = 3 }, // stock -> sawmill
+        .{ .from = 3, .to = 4 }, // sawmill -> forester
+        .{ .from = 4, .to = 5 }, // forester -> farm
+        .{ .from = 2, .to = 6 }, // stock -> tower
+        .{ .from = 2, .to = 7 }, // stock -> stonecutter
+        .{ .from = 2, .to = 8 }, // stock -> mill
+    };
+
+    for (links) |link| {
+        if (link.from >= positions.len or link.to >= positions.len) continue;
+        const from_pos = positions[link.from];
+        const to_pos = positions[link.to];
+
+        // Each building's flag is at down_right of the building position.
+        const from_flag = map.wrapPos(from_pos.move(.down_right));
+        const to_flag = map.wrapPos(to_pos.move(.down_right));
+
+        // Both must have flags.
+        if (!map.getTile(from_flag).has_flag or !map.getTile(to_flag).has_flag) continue;
+        if (from_flag.eql(to_flag)) continue;
+
+        // Clear a corridor of terrain to grass along the greedy path so the
+        // road can always be built (no water/mountain blocking).
+        var path_buf: [128]u8 = undefined;
+        var path_len: usize = 0;
+        var p = from_flag;
+        var steps: usize = 0;
+        while (steps < path_buf.len and !p.eql(to_flag)) : (steps += 1) {
+            const d = bestStepDir(p, to_flag, map) orelse break;
+            path_buf[path_len] = @intFromEnum(d);
+            path_len += 1;
+            p = map.wrapPos(p.move(d));
+        }
+
+        if (!p.eql(to_flag) or path_len == 0) continue;
+
+        // Now clear terrain along the path (flags and buildings preserved).
+        p = from_flag;
+        for (path_buf[0..path_len]) |d| {
+            p = map.wrapPos(p.move(@enumFromInt(d)));
+            if (!map.getTile(p).has_flag and !map.getTile(p).has_building) {
+                map.getTile(p).terrain = .grass;
+            }
+        }
+
+        if (game.buildRoad(from_flag, to_flag, path_buf[0..path_len])) {
+            connected += 1;
+        }
+    }
+
+    std.debug.print("  Roads: {} connections built\n", .{connected});
 }
 
 fn runTerminalDemo(allocator: std.mem.Allocator, opts: CliOptions) !void {

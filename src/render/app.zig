@@ -80,6 +80,9 @@ pub const AppOptions = struct {
     /// of the default center cluster, so zoom-out rendering can be verified at
     /// every position and every torus offset copy.
     scatter_buildings: bool = false,
+    /// When true, connect the placed buildings' flags with roads after placing
+    /// them, so road rendering can be screenshot-tested.
+    build_roads: bool = false,
 };
 
 /// A 1x1 white fallback texture for when the real atlas isn't loaded.
@@ -223,6 +226,8 @@ pub const App = struct {
     perf_frames: u64 = 0,
     /// Spread buildings across the whole map for zoom-out render testing.
     scatter_buildings: bool = false,
+    /// Connect placed buildings with roads for screenshot testing.
+    build_roads: bool = false,
     frame_count: u64 = 0,
     fps: f32 = 0,
     frame_times: [60]f64 = @splat(0),
@@ -353,6 +358,7 @@ pub const App = struct {
             .perf_log = opts.perf_log,
             .perf_frames = opts.perf_frames,
             .scatter_buildings = opts.scatter_buildings,
+            .build_roads = opts.build_roads,
         };
     }
 

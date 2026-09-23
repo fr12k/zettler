@@ -873,7 +873,11 @@ pub const Game = struct {
             // Only the final destination may have a flag (no mid-road flags).
             if (i < path.len - 1 and tile.has_flag) return null;
             if (tile.has_building) return null;
-            if (tile.terrain.isWater()) has_water = true else has_ground = true;
+            // Water/ground classification: flag tiles are endpoints and their
+            // terrain type shouldn't cause a mixed water/ground rejection.
+            if (!tile.has_flag) {
+                if (tile.terrain.isWater()) has_water = true else has_ground = true;
+            }
         }
         // A road can't mix land and water.
         if (has_water and has_ground) return null;
