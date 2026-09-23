@@ -1291,46 +1291,17 @@ pub const App = struct {
         return .{ .mask = mask, .ground = ground };
     }
 
-    /// Draw a single road segment sprite from `pos` in direction `dir`, at the
-    /// given torus offset. Ports freeserf's `draw_path_segment` (viewport.cc:394).
+    /// Draw a single road segment from `pos` in direction `dir`, at the given
+    /// torus offset. Uses colored lines between tile centers for guaranteed
+    /// connectivity, with a road-brown color matching the original game's roads.
     fn drawRoadSegment(self: *App, batcher: *SpriteBatcher, pos: core.MapPos, dir: core.Direction, off_x: f32, off_y: f32) void {
-        const indices = self.roadSpriteIndices(pos, dir) orelse return;
-        const entry = self.atlas.getRoadSprite(indices.mask, indices.ground) orelse return;
-
         const map = &self.game.state.map;
-        const tw: f32 = map_renderer_mod.TileWidth;
-        const th: f32 = map_renderer_mod.TileHeight;
-        const hw: f32 = tw / 2.0;
-        const h1: f32 = @floatFromInt(map.getHeight(pos));
-
-        // Base world position of the source tile's left vertex.
-        // screen_x = col*TW - row*HW, screen_y = row*TH - HEIGHT_SCALE*h
-        const wx = @as(f32, @floatFromInt(pos.x)) * tw - @as(f32, @floatFromInt(pos.y)) * hw;
-        const wy = @as(f32, @floatFromInt(pos.y)) * th - map_renderer_mod.HEIGHT_SCALE * h1;
-
-        // The road composite sprite is 32x20 (ground size) with the road strip
-        // vertically centered. Draw it at the tile's left vertex position.
-        // Per-direction x offset: DownRight and Down masks are 16px wide (half
-        // tile), so they need to be shifted to cover the correct half of the
-        // tile diamond.
-        var lx = wx;
-        const ly = wy;
-        switch (dir) {
-            .right => {
-                // 32px mask covers the full tile width. No x offset.
-            },
-            .down_right => {
-                // 16px mask covers the right half of the diamond.
-                lx += hw;
-            },
-            .down => {
-                // 16px mask covers the left half of the diamond.
-                lx -= hw;
-            },
-            else => return,
-        }
-
-        addSprite(batcher, entry, lx + off_x, ly + off_y, 1.0, 1.0);
+        const c0 = self.tileCenter(pos);
+        const nb = map.getNeighborWrapped(pos, dir);
+        const c1 = self.tileCenter(nb);
+        // Road color: warm brown, matching the original Settlers road texture.
+        addLine(batcher, c0[0] + off_x, c0[1] + off_y, c1[0] + off_x, c1[1] + off_y, 5.0,
+            .{ 0.72, 0.56, 0.36, 1.0 });
     }
 
     /// Draw roads (sprite-based segments from the 6-bit paths bitmask), flag
@@ -1343,28 +1314,17 @@ pub const App = struct {
 
         const fwd = [_]core.Direction{ .right, .down_right, .down };
         const b = self.camera.visibleWorldBounds();
-        const use_atlas = self.atlas_loaded and self.atlas.uploaded;
 
         // Road segments: for each visible tile with paths, draw the 3 forward
-        // direction segments as sprite composites (or fallback lines).
+        // direction segments as connected brown lines between tile centers.
         var it = culling_mod.visibleTiles(b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited);
         while (it.next()) |pos| {
             const t = map.getTile(pos);
             if (!t.hasRoad() and !t.has_flag) continue;
-            const c0_base = self.tileCenter(pos);
             for (self.frame_offsets[0..self.num_offsets]) |off| {
-                const c0x = c0_base[0] + off[0];
-                const c0y = c0_base[1] + off[1];
                 for (fwd) |d| {
                     if (!map.hasPath(pos, d)) continue;
-                    const np = map.getNeighborWrapped(pos, d);
-                    if (use_atlas) {
-                        self.drawRoadSegment(batcher, pos, d, off[0], off[1]);
-                    } else {
-                        // Fallback: brown line between tile centers.
-                        const c1_base = self.tileCenter(np);
-                        addLine(batcher, c0x, c0y, c1_base[0] + off[0], c1_base[1] + off[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
-                    }
+                    self.drawRoadSegment(batcher, pos, d, off[0], off[1]);
                 }
             }
         }
@@ -1405,11 +1365,11 @@ pub const App = struct {
             }
         }
 
-        // Road-building preview: draw the pending road segments as sprites
-        // (same as real roads), or a straight line fallback.
+        // Road-building preview: draw the pending road segments as lines
+        // (same as real roads), or a straight line if no path.
         if (self.road_builder.active and self.road_builder.has_start) {
-            if (use_atlas and self.road_builder.has_path) {
-                // Draw each pending segment as a road sprite preview.
+            if (self.road_builder.has_path) {
+                // Draw each pending segment as a road line preview.
                 const p = self.road_builder.start_flag_pos;
                 const dirs = self.road_builder.road.dirsSlice();
                 for (self.frame_offsets[0..1]) |off| {
@@ -1420,14 +1380,10 @@ pub const App = struct {
                     }
                 }
             } else {
-                // Fallback: line from start to cursor.
+                // No path: red line from start to cursor.
                 const c0 = self.tileCenter(self.road_builder.start_flag_pos);
                 const c1 = self.tileCenter(self.road_builder.cursor_pos);
-                const col: [4]f32 = if (self.road_builder.has_path)
-                    .{ 0.2, 0.9, 0.2, 0.8 }
-                else
-                    .{ 0.9, 0.2, 0.2, 0.8 };
-                addLine(batcher, c0[0], c0[1], c1[0], c1[1], 3.0, col);
+                addLine(batcher, c0[0], c0[1], c1[0], c1[1], 3.0, .{ 0.9, 0.2, 0.2, 0.8 });
             }
         }
 
@@ -1455,15 +1411,10 @@ pub const App = struct {
         }
 
         if (batcher.sprite_count == 0) return;
-        // Use the atlas texture if available (road sprites are packed in it);
-        // otherwise the white fallback texture for lines/flag posts.
-        if (use_atlas) {
-            var atlas_tex = Texture{ .id = self.atlas.gl_texture, .width = texture_atlas_mod.ATLAS_SIZE, .height = texture_atlas_mod.ATLAS_SIZE };
-            batcher.render(&self.shader, &atlas_tex, &self.camera);
-        } else {
-            var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
-            batcher.render(&self.shader, &white_tex, &self.camera);
-        }
+        // Roads and flag posts use colored lines/quads with the white
+        // fallback texture (the shader multiplies texture by vertex color).
+        var white_tex = Texture{ .id = fallback_tex, .width = 1, .height = 1 };
+        batcher.render(&self.shader, &white_tex, &self.camera);
     }
 
     /// Queue one building into the sprite batcher. Completed buildings draw their

@@ -221,8 +221,8 @@ pub const BmpDecoder = struct {
 
         // The mask is typically smaller than the ground sprite (e.g. 32x9 mask
         // on a 32x20 ground). Center the mask vertically within the ground so
-        // the road strip aligns to the tile edge (which is at the vertical
-        // center of the diamond).
+        // the road strip aligns to the tile center (the terrain diamond's
+        // vertical center is at row 10 of the 20px sprite).
         const mask_dx: i32 = @as(i32, mask.offset_x) - @as(i32, ground.offset_x);
         const mask_dy: i32 = @as(i32, mask.offset_y) - @as(i32, ground.offset_y) +
             @divTrunc(@as(i32, @intCast(h)) - @as(i32, @intCast(mask.height)), 2);
