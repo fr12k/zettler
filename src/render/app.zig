@@ -157,6 +157,20 @@ fn addLine(batcher: *SpriteBatcher, x0: f32, y0: f32, x1: f32, y1: f32, thick: f
     );
 }
 
+/// Territory border color for a given player index (0-5). Each player gets
+/// a distinct color so territory boundaries are visually clear.
+fn playerBorderColor(player: u8) [4]f32 {
+    return switch (player) {
+        0 => .{ 0.9, 0.9, 0.2, 0.7 }, // yellow
+        1 => .{ 0.2, 0.6, 0.9, 0.7 }, // blue
+        2 => .{ 0.9, 0.2, 0.2, 0.7 }, // red
+        3 => .{ 0.2, 0.9, 0.3, 0.7 }, // green
+        4 => .{ 0.8, 0.3, 0.9, 0.7 }, // purple
+        5 => .{ 0.9, 0.5, 0.1, 0.7 }, // orange
+        else => .{ 0.5, 0.5, 0.5, 0.7 }, // gray (unknown)
+    };
+}
+
 /// PAK sprite id for a standing object of the given family + variant (0..7).
 fn objectSpriteId(obj: MapObject, variant: u8) u16 {
     const v: u16 = @min(variant, 7);
@@ -1330,6 +1344,31 @@ pub const App = struct {
                         const c1_base = self.tileCenter(np);
                         addLine(batcher, c0x, c0y, c1_base[0] + off[0], c1_base[1] + off[1], 4.0, .{ 0.55, 0.4, 0.22, 1.0 });
                     }
+                }
+            }
+        }
+
+        // Territory borders: for each visible owned tile, if a forward neighbour
+        // has a different owner and no road, draw a thin colored line marking
+        // the territory boundary. Ports freeserf draw_border_segment
+        // (viewport.cc:544). Only drawn for tiles that have an owner (0xFF = unowned).
+        var border_it = culling_mod.visibleTiles(b.min_x, b.min_y, b.max_x, b.max_y, map.*, self.cull_visited);
+        while (border_it.next()) |pos| {
+            const t = map.getTile(pos);
+            if (t.owner == 0xFF) continue;
+            const c0_base = self.tileCenter(pos);
+            for (self.frame_offsets[0..self.num_offsets]) |off| {
+                const c0x = c0_base[0] + off[0];
+                const c0y = c0_base[1] + off[1];
+                for (fwd) |d| {
+                    if (map.hasPath(pos, d)) continue; // road takes priority
+                    const np = map.getNeighborWrapped(pos, d);
+                    const nt = map.getTile(np);
+                    if (nt.owner == t.owner or nt.owner == 0xFF) continue;
+                    // Draw a thin line between tile centers, colored by the source owner.
+                    const c1_base = self.tileCenter(np);
+                    const border_col = playerBorderColor(t.owner);
+                    addLine(batcher, c0x, c0y, c1_base[0] + off[0], c1_base[1] + off[1], 2.0, border_col);
                 }
             }
         }
